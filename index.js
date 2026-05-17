@@ -432,7 +432,7 @@ new Chart(document.getElementById("cHist"),{type:"line",data:{labels:datas.map(f
     res.status(500).send("Erro: " + err.message);
   }
 });
-app.get("/dashboard", (_req, res) => { res.send("ok dashboard"); });
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
