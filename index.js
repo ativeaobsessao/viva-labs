@@ -322,6 +322,167 @@ app.get("/api/paginas", async (_req, res) => {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
+app.get("/admin", async (_req, res) => {
+  const { rows: pages } = await query("SELECT slug, nome, url, tipo, created_at FROM pages ORDER BY tipo, created_at DESC");
+  const lista = pages.map(p => `
+    <tr>
+      <td><span class="badge ${p.tipo==='dominio'?'b-dom':'b-pag'}">${p.tipo==='dominio'?'🌐 Domínio':'📡 Biblioteca'}</span></td>
+      <td class="nome">${p.nome}</td>
+      <td><a href="${p.url}" target="_blank" class="url-link">Ver na Meta ↗</a></td>
+      <td>${new Date(p.created_at).toLocaleDateString('pt-BR')}</td>
+      <td>
+        <form method="POST" action="/admin/remover" onsubmit="return confirm('Remover ${p.nome}?')">
+          <input type="hidden" name="slug" value="${p.slug}">
+          <button type="submit" class="btn-del">Remover</button>
+        </form>
+      </td>
+    </tr>`).join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VIVA Labs — Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:960px;margin:0 auto}
+.hdr{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.hdr-logo{height:38px}
+.hdr h1{font-size:18px;font-weight:700}
+.hdr a{margin-left:auto;font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px}
+.hdr a:hover{background:var(--accent);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;margin-bottom:20px}
+.card h2{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:18px}
+.form-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:12px;align-items:end}
+@media(max-width:700px){.form-grid{grid-template-columns:1fr}}
+.field{display:flex;flex-direction:column;gap:6px}
+label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input,select{background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:14px;padding:10px 14px;outline:none;transition:border-color .2s}
+input:focus,select:focus{border-color:var(--accent)}
+input::placeholder{color:var(--muted)}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:10px 22px;cursor:pointer;transition:opacity .2s}
+.btn:hover{opacity:.85}
+.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}
+.btn-del:hover{background:var(--down);color:#fff}
+.tip{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.6;background:#0f0f1e;border-radius:8px;padding:12px 14px;border-left:3px solid var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
+td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+.nome{font-weight:600;color:#fff}
+.url-link{color:var(--accent);font-size:12px;text-decoration:none;font-family:'Space Mono',monospace}
+.url-link:hover{text-decoration:underline}
+.badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600}
+.b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-pag{background:rgba(52,211,153,.12);color:#34d399}
+.msg{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:18px}
+.msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
+.msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:24px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <img class="hdr-logo" src="/logo" alt="VIVA Labs">
+  <h1>Painel Admin — Cadastro de Rastreamentos</h1>
+  <a href="/dashboard">← Ver Dashboard</a>
+</div>
+
+${pages.length === 0 ? '' : ''}
+
+<div class="card">
+  <h2>➕ Cadastrar novo rastreamento</h2>
+  <form method="POST" action="/admin/salvar">
+    <div class="form-grid">
+      <div class="field">
+        <label>Tipo</label>
+        <select name="tipo" id="tipoSelect" onchange="atualizarDica()">
+          <option value="pagina">📡 Biblioteca (página)</option>
+          <option value="dominio">🌐 Domínio (URL)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Nome</label>
+        <input type="text" name="nome" placeholder="Ex: Protaflo ou SYNTROHEALTH.SITE" required>
+      </div>
+      <button type="submit" class="btn">Cadastrar</button>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label>URL da Meta Ad Library</label>
+      <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+    </div>
+    <div class="tip" id="dica">
+      💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>
+      Exemplo: <code>https://www.facebook.com/ads/library/?id=XXXXXXXXX</code>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
+  ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
+  <table>
+    <thead><tr><th>Tipo</th><th>Nome</th><th>Link</th><th>Cadastrado</th><th></th></tr></thead>
+    <tbody>${lista}</tbody>
+  </table>`}
+</div>
+
+<script>
+function atualizarDica(){
+  const tipo=document.getElementById('tipoSelect').value;
+  const dica=document.getElementById('dica');
+  const url=document.getElementById('urlInput');
+  if(tipo==='dominio'){
+    dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
+    url.placeholder='https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM...';
+  }else{
+    dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
+    url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
+  }
+}
+</script>
+</body>
+</html>`);
+});
+
+// Rota que processa o form de cadastro
+app.post("/admin/salvar", async (req, res) => {
+  const { nome, url, tipo } = req.body;
+  if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
+  const slug = toSlug(nome);
+  if (!slug) return res.redirect("/admin?erro=nome-invalido");
+  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+  try {
+    await query(
+      `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
+      [slug, nome, url, tipoFinal]
+    );
+    console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
+    res.redirect("/admin?ok=1");
+  } catch(err) {
+    console.error("[ADMIN] erro:", err.message);
+    res.redirect("/admin?erro=erro-interno");
+  }
+});
+
+// Rota que processa remoção
+app.post("/admin/remover", async (req, res) => {
+  const { slug } = req.body;
+  if (!slug) return res.redirect("/admin");
+  await query("DELETE FROM pages WHERE slug=$1", [slug]);
+  console.log(`[ADMIN] removeu slug=${slug}`);
+  res.redirect("/admin?ok=removido");
+});
+
+// Servir a logo inline (evita dependência externa)
+app.get("/logo", (_req, res) => {
+  // Redireciona pro placeholder caso a logo nao esteja disponível
+  res.redirect("/dashboard");
+});
+
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query("SELECT slug, nome, tipo FROM pages");
@@ -564,12 +725,12 @@ tbody tr:hover td{background:var(--surface2)}
   </table>
 </div>
 
-<div class="section-label" style="margin-top:26px">📅 Histórico de coletas · 03h · 12h · 22h</div>
+<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — Domínio · 03h · 12h · 22h</div>
 <div class="tbl-panel" id="dom_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
   Carregando histórico...
 </div>
 
-<div style="height:30px"></div>
+<div style="height:36px"></div>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
@@ -602,7 +763,7 @@ tbody tr:hover td{background:var(--surface2)}
   </table>
 </div>
 
-<div class="section-label" style="margin-top:26px">📅 Histórico de coletas · 03h · 12h · 22h</div>
+<div class="section-label" style="margin-top:26px">📅 Histórico de coletas — Bibliotecas · 03h · 12h · 22h</div>
 <div class="tbl-panel" id="pag_hist-section" style="padding:16px 18px;color:var(--muted);font-size:13px">
   Carregando histórico...
 </div>

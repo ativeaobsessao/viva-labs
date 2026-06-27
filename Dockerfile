@@ -12,7 +12,7 @@ RUN npm install
 RUN npx playwright install chromium
 
 # Copy source
-ARG CACHEBUST=3
+ARG CACHEBUST=4
 COPY index.js ./src/index.js
 
 # Expose port
