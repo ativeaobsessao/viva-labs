@@ -485,7 +485,7 @@ app.get("/logo", (_req, res) => {
 
 app.get("/dashboard", async (_req, res) => {
   try {
-    const { rows: allPages } = await query("SELECT slug, nome, tipo FROM pages");
+    const { rows: allPages } = await query("SELECT slug, nome, url, tipo FROM pages");
 
     // Função que processa um conjunto de páginas e devolve os 2 pacotes de dados
     // (dados gerais + dados da tabela histórica) para aquele grupo.
@@ -503,7 +503,7 @@ app.get("/dashboard", async (_req, res) => {
           [p.slug]
         );
         if (!hist.length) continue;
-        ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count };
+        ultimaLeitura[p.nome] = { ads: hist[hist.length - 1].ads_count, url: p.url };
         primeiraData[p.nome] = new Date(hist[0].collected_at_br).toISOString().slice(0, 10);
         mon[p.nome] = { ini: hist[0].ads_count };
         paginas[p.nome] = {};
@@ -589,6 +589,8 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .scale-pct{font-weight:600;font-family:'Space Mono',monospace}
 .scale-spark{margin-top:10px;height:32px;position:relative}
 .empty-hint{background:var(--surface);border:1px dashed var(--border);border-radius:12px;padding:22px;text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px}
+.lib-link{color:var(--text);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:1px;transition:color .15s,border-color .15s}
+.lib-link:hover{color:var(--accent);border-color:var(--accent)}
 .grid-charts{display:grid;grid-template-columns:380px 1fr;gap:14px;margin-bottom:26px}
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
 .panel-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
@@ -841,7 +843,7 @@ porAds.forEach((pag,idx)=>{
   const corLib=COR[idx%COR.length];
   const tr=document.createElement("tr");
   tr.innerHTML='<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
-    +'<td class="t-name">'+pag+'</td>'
+    +'<td class="t-name"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></td>'
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
     +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
