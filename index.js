@@ -970,6 +970,8 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .hdr h1{font-size:19px;font-weight:700;color:#fff;letter-spacing:.2px}
 .hdr-sub{font-size:12px;color:var(--text2);margin-top:3px;font-family:'Space Mono',monospace}
 .hdr-live{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text2);background:var(--surface);border:1px solid var(--border);padding:7px 14px;border-radius:8px}
+.hdr-admin-btn{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px;transition:all .15s;white-space:nowrap}
+.hdr-admin-btn:hover{background:var(--accent);color:#fff}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
@@ -1035,6 +1037,7 @@ tbody tr:hover td{background:var(--surface2)}
   body{padding:12px}
   .hdr{flex-wrap:wrap;gap:8px}
   .hdr-live{margin-left:0;width:100%}
+  .hdr-admin-btn{width:100%;justify-content:center;box-sizing:border-box}
   .hdr h1{font-size:15px}
   .hdr-sub{font-size:10px}
   .scaling-strip{grid-template-columns:1fr 1fr}
@@ -1090,7 +1093,10 @@ tbody tr:hover td{background:var(--surface2)}
     <h1>Monitor de Bibliotecas</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
-  <div class="hdr-live"><span class="dot"></span><span id="livecount"></span></div>
+  <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
+    <div class="hdr-live" style="margin-left:0"><span class="dot"></span><span id="livecount"></span></div>
+    <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
+  </div>
 </div>
 
 <div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
@@ -1365,7 +1371,7 @@ const D_PAG=__DADOS_PLACEHOLDER__;
 const HD_PAG=__HIST_PLACEHOLDER__;
 
 const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
-document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" bibliotecas";
+document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
 
 render(D_DOM,HD_DOM,"dom_");
 render(D_PAG,HD_PAG,"pag_");
