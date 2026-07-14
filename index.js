@@ -31,10 +31,14 @@ async function query(sql, params = []) {
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
-      slug        TEXT PRIMARY KEY,
-      nome        TEXT NOT NULL,
-      url         TEXT NOT NULL,
-      created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+      slug          TEXT PRIMARY KEY,
+      nome          TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      tipo          TEXT NOT NULL DEFAULT 'pagina',
+      instagram_url TEXT,
+      geo           TEXT,
+      nicho         TEXT,
+      created_at    TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
@@ -43,6 +47,7 @@ async function initDb() {
       id           SERIAL PRIMARY KEY,
       slug         TEXT NOT NULL,
       ads_count    INTEGER NOT NULL,
+      slot         SMALLINT,
       collected_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
@@ -51,8 +56,6 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_scrape_history_slug ON scrape_history(slug)
   `);
 
-  // Tabela para última leitura de cada slug (coleta manual e automática)
-  // Só guarda 1 linha por slug — sempre o valor mais recente
   await query(`
     CREATE TABLE IF NOT EXISTS scrape_latest (
       slug         TEXT PRIMARY KEY,
@@ -60,20 +63,36 @@ async function initDb() {
       collected_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
-  // Migração: adiciona coluna 'tipo' se ainda não existe.
-  // Registros antigos (sem tipo) viram 'pagina' automaticamente.
-  await query(`
-    ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'
-  `);
 
-  // FIX #4 — Migração: coluna que guarda o snapshot de ads_count capturado
-  // no EXATO momento do cadastro. Uma vez preenchida, nunca é sobrescrita —
-  // é o baseline imutável usado como "Inicial" na dashboard. Itens antigos
-  // (cadastrados antes dessa migração) ficam com NULL e o dashboard cai no
-  // fallback (primeira linha de scrape_history), preservando compatibilidade.
+  // Migrações: garante colunas novas em banco antigo (seguro rodar sempre)
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'pagina'`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS instagram_url TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
+
   await query(`
-    ALTER TABLE pages ADD COLUMN IF NOT EXISTS inicial_count INTEGER
+    CREATE TABLE IF NOT EXISTS funnel_nodes (
+      id         SERIAL PRIMARY KEY,
+      slug       TEXT NOT NULL REFERENCES pages(slug) ON DELETE CASCADE,
+      tipo       TEXT NOT NULL CHECK (tipo IN ('advertorial','tsl','vsl','quiz','whatsapp','checkout')),
+      rotulo     TEXT NOT NULL,
+      url        TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
   `);
+  await query(`
+    CREATE TABLE IF NOT EXISTS funnel_edges (
+      id           SERIAL PRIMARY KEY,
+      from_node_id INTEGER NOT NULL REFERENCES funnel_nodes(id) ON DELETE CASCADE,
+      to_node_id   INTEGER NOT NULL REFERENCES funnel_nodes(id) ON DELETE CASCADE,
+      created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_funnel_nodes_slug ON funnel_nodes(slug)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_from ON funnel_edges(from_node_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_to ON funnel_edges(to_node_id)`);
 
   console.log("[DB] Tables ready.");
 }
@@ -105,7 +124,7 @@ function getChromiumPath() {
   }
 }
 
-// ─── Scraper ──────────────────────────────────────────────────────────────────
+// ─── Scraper ─────────────────────────────────────────────────────────────────
 
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
@@ -171,13 +190,7 @@ async function scrapeAdCount(url, retries = 3) {
   return 0;
 }
 
-// ─── FIX #2: dedupe agora considera o slot, não só o slug ─────────────────────
-// Antes: qualquer insert em scrape_history nos últimos 60s (de QUALQUER slot,
-// inclusive slot=NULL vindo de coleta manual) bloqueava o insert seguinte,
-// mesmo que fosse o do cron com o slot certo. Isso podia "engolir" a gravação
-// legítima do cron caso colidisse no tempo com uma chamada manual.
-// Agora o dedupe só bloqueia duplicata do MESMO slot (slot NULL só bloqueia
-// contra outro slot NULL, via IS NOT DISTINCT FROM).
+// Dedupe considera slot — só bloqueia duplicata do MESMO slot
 async function saveCount(slug, count, slot) {
   console.log(`[SAVECOUNT] slug=${slug} slot=${slot}`);
   const { rows: recent } = await query(
@@ -189,11 +202,10 @@ async function saveCount(slug, count, slot) {
     [slug, slot]
   );
 
-  // Sempre atualiza o "atual" na scrape_latest (independente de duplicata)
   await query(
     `INSERT INTO scrape_latest (slug, ads_count, collected_at)
      VALUES ($1, $2, NOW())
-     ON CONFLICT (slug) DO UPDATE 
+     ON CONFLICT (slug) DO UPDATE
        SET ads_count    = EXCLUDED.ads_count,
            collected_at = EXCLUDED.collected_at`,
     [slug, count]
@@ -207,16 +219,10 @@ async function saveCount(slug, count, slot) {
   }
 }
 
-// ─── FIX #4: captura Descoberta+Inicial no exato momento do cadastro ─────────
-// Chamada logo após o INSERT em 'pages'. Faz UMA coleta síncrona da URL e:
-//   1. Grava em pages.inicial_count — só se ainda estiver NULL (COALESCE),
-//      pra nunca sobrescrever o baseline em caso de re-cadastro/edição.
-//   2. Atualiza scrape_latest, pra "Atual" já aparecer certo na dashboard.
-// NÃO grava em scrape_history — isso continua sendo território exclusivo
-// do cron, mantendo a regra do blueprint intacta.
+// Captura inicial no momento do cadastro (individual)
 async function captureInicial(slug, url) {
   try {
-    const count = await scrapeAdCount(url, 2); // 2 tentativas — não travar demais o form
+    const count = await scrapeAdCount(url, 2);
     await query(
       `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
       [slug, count]
@@ -224,7 +230,7 @@ async function captureInicial(slug, url) {
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE 
+       ON CONFLICT (slug) DO UPDATE
          SET ads_count    = EXCLUDED.ads_count,
              collected_at = EXCLUDED.collected_at`,
       [slug, count]
@@ -237,10 +243,7 @@ async function captureInicial(slug, url) {
   }
 }
 
-// FIX #5: versão de captureInicial que reaproveita um browser/context já
-// aberto (em vez de abrir e fechar um Chromium novo pra cada item, como o
-// captureInicial individual faz). Mesmo padrão de reuso que o runAllScrapes
-// já usa no cron — reduz bastante o tempo por item num lote.
+// Versão de captureInicial que reutiliza browser já aberto (para lotes)
 async function captureInicialWithContext(context, slug, url) {
   let count = null;
   for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
@@ -260,13 +263,7 @@ async function captureInicialWithContext(context, slug, url) {
   return final;
 }
 
-// FIX #5: processa o lote inteiro em segundo plano (fire-and-forget) — a
-// requisição HTTP que chamou isso já respondeu antes desta função rodar,
-// exatamente como o /api/coletar-tudo manual já faz hoje. Evita qualquer
-// timeout de proxy do Render em lotes grandes.
-// Compartilha o MESMO lock (isRunning) usado pelo cron — se o cron disparar
-// no meio de um lote (ou vice-versa), um dos dois espera o outro terminar,
-// nunca rodam dois Chromium ao mesmo tempo no plano free.
+// Processa lote em background (fire-and-forget)
 async function runLote(itens) {
   if (isRunning) {
     console.warn("[LOTE] abortado — já existe uma coleta em andamento (cron ou outro lote)");
@@ -309,9 +306,11 @@ async function runLote(itens) {
       }
       try {
         await query(
-          `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
-          [slug, item.nome, item.url, item.tipo]
+          `INSERT INTO pages (slug, nome, url, tipo, instagram_url)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4,
+             instagram_url = COALESCE(EXCLUDED.instagram_url, pages.instagram_url)`,
+          [slug, item.nome, item.url, item.tipo, item.instagram_url || null]
         );
         await captureInicialWithContext(context, slug, item.url);
         console.log(`[LOTE] slug=${slug} cadastrado e capturado (${loteStatus.concluidos + 1}/${itens.length})`);
@@ -336,24 +335,12 @@ async function runLote(itens) {
 
 function resolveSlot(trigger) {
   switch (trigger) {
-    case "cron-03h":
-      return 3;
-
-    case "cron-12h":
-      return 12;
-
-    case "cron-22h":
-      return 22;
-
-    default:
-      return null;
+    case "cron-03h": return 3;
+    case "cron-12h": return 12;
+    case "cron-22h": return 22;
+    default: return null;
   }
 }
-
-
-// ─── Optional: mirror to Google Sheet (backup) ──────────────────────────────────
-// Set SHEET_WEBHOOK_URL env var to a Make.com/Apps Script webhook to keep the
-// spreadsheet alive as backup. If unset, this is silently skipped.
 
 async function mirrorToSheet(rows) {
   const url = process.env.SHEET_WEBHOOK_URL;
@@ -370,13 +357,8 @@ async function mirrorToSheet(rows) {
   }
 }
 
-// ─── Scheduled run: scrape ALL pages reusing one browser ────────────────────────
-
 let isRunning = false;
 
-// ─── FIX #5: Cadastro em lote ────────────────────────────────────────────────
-// Estado do lote fica só em memória (não precisa de tabela nova no banco —
-// é informação temporária, útil só enquanto o lote está rodando).
 let loteStatus = {
   emAndamento: false,
   total: 0,
@@ -387,36 +369,50 @@ let loteStatus = {
   finalizadoEm: null,
 };
 
-// Aceita linhas em 2 formatos:
-//   Nome | URL                  → tipo é auto-detectado pela própria URL
-//   tipo | Nome | URL           → tipo forçado manualmente (dominio/pagina)
+// Parser de lote — aceita 3 formatos:
+//   Nome | URL
+//   tipo | Nome | URL
+//   Nome | URL | https://instagram.com/...   (Instagram no final — opcional)
+//   tipo | Nome | URL | https://instagram.com/...
 function parseLoteInput(texto) {
   const linhas = texto.split("\n").map((l) => l.trim()).filter(Boolean);
   const itens = [];
   for (const linha of linhas) {
     const partes = linha.split("|").map((s) => s.trim()).filter(Boolean);
-    let nome, url, tipoForcado = null;
-    if (partes.length >= 3) {
+    let nome, url, tipoForcado = null, instagram_url = null;
+
+    if (partes.length >= 2) {
       const possivelTipo = partes[0].toLowerCase();
       if (possivelTipo === "dominio" || possivelTipo === "pagina") {
+        // tipo | Nome | URL [| Instagram]
         tipoForcado = possivelTipo;
         nome = partes[1];
-        url = partes.slice(2).join("|");
+        // Verifica se o último campo é uma URL do Instagram
+        const ultimo = partes[partes.length - 1];
+        if (partes.length >= 4 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
+          instagram_url = ultimo;
+          url = partes.slice(2, partes.length - 1).join("|");
+        } else {
+          url = partes.slice(2).join("|");
+        }
       } else {
+        // Nome | URL [| Instagram]
         nome = partes[0];
-        url = partes.slice(1).join("|");
+        const ultimo = partes[partes.length - 1];
+        if (partes.length >= 3 && (ultimo.includes("instagram.com") || ultimo.startsWith("https://www.instagram"))) {
+          instagram_url = ultimo;
+          url = partes.slice(1, partes.length - 1).join("|");
+        } else {
+          url = partes.slice(1).join("|");
+        }
       }
-    } else if (partes.length === 2) {
-      nome = partes[0];
-      url = partes[1];
     } else {
       continue; // linha sem "|" ou vazia — ignora
     }
+
     if (!nome || !url) continue;
-    // Auto-detecção: URL de Biblioteca sempre tem view_all_page_id=,
-    // URL de Domínio sempre é busca por keyword (q=...).
     const tipo = tipoForcado || (url.includes("view_all_page_id=") ? "pagina" : "dominio");
-    itens.push({ nome, url, tipo });
+    itens.push({ nome, url, tipo, instagram_url });
   }
   return itens;
 }
@@ -461,25 +457,20 @@ async function runAllScrapes(trigger = "cron") {
       }
       const final = count ?? 0;
 
-    // Sempre atualiza scrape_latest (via saveCount)
-    // Só salva em scrape_history se for coleta automática do cron
-    if (trigger.startsWith('cron')) {
-      const slot = resolveSlot(trigger);
-      await saveCount(p.slug, final, slot);
-    } else
-
-      {
-      // Coleta manual: atualiza apenas o "atual" sem poluir o histórico
-      await query(
-        `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-         VALUES ($1, $2, NOW())
-         ON CONFLICT (slug) DO UPDATE 
-           SET ads_count    = EXCLUDED.ads_count,
-               collected_at = EXCLUDED.collected_at`,
-        [p.slug, final] // <-- Corrigido aqui de 'slug' para 'p.slug'
-      );
-      console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
-    }
+      if (trigger.startsWith("cron")) {
+        const slot = resolveSlot(trigger);
+        await saveCount(p.slug, final, slot);
+      } else {
+        await query(
+          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (slug) DO UPDATE
+             SET ads_count    = EXCLUDED.ads_count,
+                 collected_at = EXCLUDED.collected_at`,
+          [p.slug, final]
+        );
+        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
+      }
 
       results.push({ slug: p.slug, nome: p.nome, count: final });
     }
@@ -496,31 +487,57 @@ async function runAllScrapes(trigger = "cron") {
   return { pages: results.length, durationSec: secs, results };
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
   if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   await query(
-    `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (slug) DO UPDATE SET nome = $2, url = $3, tipo = $4`,
-    [slug, nome, url, tipoFinal]
+    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (slug) DO UPDATE
+       SET nome=$2, url=$3, tipo=$4,
+           instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
+           geo=COALESCE(EXCLUDED.geo, pages.geo),
+           nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
+           funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
-  const inicial = await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora
+
+  let inicial = ads_count_inicial;
+  if (inicial !== undefined && inicial !== null) {
+    const countNum = parseInt(inicial, 10) || 0;
+    await query(
+      `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
+      [slug, countNum]
+    );
+    await query(
+      `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (slug) DO UPDATE
+         SET ads_count    = EXCLUDED.ads_count,
+             collected_at = EXCLUDED.collected_at`,
+      [slug, countNum]
+    );
+    await query(
+      `INSERT INTO scrape_history (slug, ads_count, slot) VALUES ($1, $2, NULL)`,
+      [slug, countNum]
+    );
+    inicial = countNum;
+    console.log(`[DESCOBERTA] slug=${slug} inicial=${countNum} salvo via Extensão (Sem Playwright)`);
+  } else {
+    inicial = await captureInicial(slug, url);
+  }
+
   res.json({ slug, tipo: tipoFinal, inicial, coletarPath: `/api/coletar/${slug}` });
 });
 
-// ─── FIX #1: /api/coletar/:slug era uma segunda porta de entrada "manual" que
-// gravava direto em scrape_history com slot=NULL, violando a regra do
-// blueprint (só o cron escreve em scrape_history). Agora essa rota se
-// comporta exatamente como o /api/coletar-tudo manual: só atualiza
-// scrape_latest, nunca insere em scrape_history.
 app.get("/api/coletar/:slug", async (req, res) => {
   const { slug } = req.params;
   const { rows } = await query("SELECT * FROM pages WHERE slug = $1 LIMIT 1", [slug]);
@@ -529,11 +546,10 @@ app.get("/api/coletar/:slug", async (req, res) => {
   try {
     const count = await scrapeAdCount(row.url);
     res.type("text/plain").send(String(count));
-    // Coleta manual/pontual: atualiza apenas o "atual", nunca polui o histórico
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT (slug) DO UPDATE 
+       ON CONFLICT (slug) DO UPDATE
          SET ads_count    = EXCLUDED.ads_count,
              collected_at = EXCLUDED.collected_at`,
       [slug, count]
@@ -588,60 +604,114 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url FROM pages");
+  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil FROM pages");
   res.json(rows);
 });
 
-// ─── Dashboard ────────────────────────────────────────────────────────────────
+// ─── Admin ───────────────────────────────────────────────────────────────────
 
 app.get("/admin", async (_req, res) => {
-  const { rows: pages } = await query("SELECT slug, nome, url, tipo, created_at FROM pages ORDER BY tipo, created_at DESC");
+  const { rows: pages } = await query(
+    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, created_at FROM pages ORDER BY tipo, created_at DESC"
+  );
+
+  // JSON de cada item, embutido no atributo data-item, usado pelo JS para preencher o formulário ao clicar em Editar
+  function escAttr(str) {
+    return String(str ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
   const lista = pages.map(p => `
     <tr>
-      <td><span class="badge ${p.tipo==='dominio'?'b-dom':'b-pag'}">${p.tipo==='dominio'?'🌐 Domínio':'📡 Biblioteca'}</span></td>
-      <td class="nome">${p.nome}</td>
+      <td><span class="badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐 Domínio" : "📡 Biblioteca"}</span></td>
+      <td class="nome-cell">
+        <div class="nome">${p.nome}</div>
+        <div class="meta-badges">
+          ${p.geo ? `<span class="meta-tag">🌍 ${p.geo}</span>` : ""}
+          ${p.nicho ? `<span class="meta-tag">🏷️ ${p.nicho}</span>` : ""}
+          ${p.funil ? `<span class="meta-tag">🎯 ${p.funil}</span>` : ""}
+          ${p.instagram_url ? `<a href="${p.instagram_url}" target="_blank" class="ig-tag">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:inline;vertical-align:middle;margin-right:3px"><rect width="24" height="24" rx="6" fill="url(#ig_admin)"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17" cy="7" r="1.2" fill="white"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><defs><linearGradient id="ig_admin" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs></svg>Instagram</a>` : ""}
+        </div>
+      </td>
       <td><a href="${p.url}" target="_blank" class="url-link">Ver na Meta ↗</a></td>
-      <td>${new Date(p.created_at).toLocaleDateString('pt-BR')}</td>
-      <td>
-        <form method="POST" action="/admin/remover" onsubmit="return confirm('Remover ${p.nome}?')">
+      <td>${new Date(p.created_at).toLocaleDateString("pt-BR")}</td>
+      <td style="white-space:nowrap">
+        <button type="button" class="btn-edit"
+          data-slug="${escAttr(p.slug)}"
+          data-nome="${escAttr(p.nome)}"
+          data-url="${escAttr(p.url)}"
+          data-tipo="${escAttr(p.tipo)}"
+          data-instagram="${escAttr(p.instagram_url)}"
+          data-geo="${escAttr(p.geo)}"
+          data-nicho="${escAttr(p.nicho)}"
+          data-funil="${escAttr(p.funil)}"
+          onclick="editarItem(this)">✏️ Editar</button>
+        <a href="/admin/funis/${p.slug}" class="btn-funis">🔀 Funis</a>
+        <form method="POST" action="/admin/remover" style="display:inline" onsubmit="return confirm('Remover ${p.nome}?')">
           <input type="hidden" name="slug" value="${p.slug}">
           <button type="submit" class="btn-del">Remover</button>
         </form>
       </td>
-    </tr>`).join('');
+    </tr>`).join("");
+
+  const msgOk = (() => {
+    const q = res.req?.query || {};
+    if (q.ok === "1") return '<div class="msg ok">✅ Rastreamento cadastrado com sucesso.</div>';
+    if (q.ok === "editado") return '<div class="msg ok">✏️ Rastreamento atualizado com sucesso.</div>';
+    if (q.ok === "removido") return '<div class="msg ok">🗑️ Rastreamento removido.</div>';
+    if (q.erro === "campos-obrigatorios") return '<div class="msg err">⚠️ Nome e URL são obrigatórios.</div>';
+    if (q.erro === "nome-invalido") return '<div class="msg err">⚠️ Nome inválido.</div>';
+    if (q.erro === "lote-vazio") return '<div class="msg err">⚠️ Nenhum item enviado no lote.</div>';
+    if (q.erro === "lote-invalido") return '<div class="msg err">⚠️ Nenhuma linha válida encontrada no lote.</div>';
+    if (q.erro === "lote-em-andamento") return '<div class="msg err">⚠️ Já existe um lote em andamento. Aguarde terminar.</div>';
+    if (q.erro === "erro-interno") return '<div class="msg err">⚠️ Erro interno. Tente novamente.</div>';
+    return "";
+  })();
 
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VIVA Labs — Admin</title>
+<title>Nutra Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:960px;margin:0 auto}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:1000px;margin:0 auto}
 .hdr{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--border)}
 .hdr h1{font-size:18px;font-weight:700}
 .hdr a{margin-left:auto;font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px}
 .hdr a:hover{background:var(--accent);color:#fff}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 24px;margin-bottom:20px}
 .card h2{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:18px}
-.form-grid{display:grid;grid-template-columns:1fr 2fr auto;gap:12px;align-items:end}
-@media(max-width:700px){.form-grid{grid-template-columns:1fr}}
+.form-row{display:grid;grid-template-columns:160px 1fr 1fr;gap:12px;align-items:end;margin-bottom:12px}
+.form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.form-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
+@media(max-width:700px){.form-row,.form-row-2,.form-row-3{grid-template-columns:1fr}}
 .field{display:flex;flex-direction:column;gap:6px}
 label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.label-optional{font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px;opacity:.7}
 input,select{background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:14px;padding:10px 14px;outline:none;transition:border-color .2s}
 input:focus,select:focus{border-color:var(--accent)}
 input::placeholder{color:var(--muted)}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:10px 22px;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.85}
-.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}
+.btn-del{background:transparent;color:var(--down);border:1px solid var(--down);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s;margin-left:6px}
+.btn-edit{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s}
+.btn-edit:hover{background:var(--accent);color:#fff}
+.btn-funis{display:inline-block;background:transparent;color:#34d399;border:1px solid #34d399;border-radius:6px;font-family:'Space Grotesk',sans-serif;font-size:11px;padding:4px 10px;cursor:pointer;transition:all .2s;text-decoration:none;margin-left:6px}
+.btn-funis:hover{background:#34d399;color:#0a0a14}
 .btn-del:hover{background:var(--down);color:#fff}
 .tip{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.6;background:#0f0f1e;border-radius:8px;padding:12px 14px;border-left:3px solid var(--accent)}
 table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
 td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
 .nome{font-weight:600;color:#fff}
+.nome-cell{vertical-align:middle}
+.meta-badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
+.meta-tag{font-size:10px;background:rgba(124,111,255,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500}
+.ig-tag{font-size:10px;background:rgba(220,39,67,.12);color:#fb7185;padding:2px 7px;border-radius:5px;font-weight:500;text-decoration:none;display:inline-flex;align-items:center;gap:3px}
+.ig-tag:hover{background:rgba(220,39,67,.25)}
 .url-link{color:var(--accent);font-size:12px;text-decoration:none;font-family:'Space Mono',monospace}
 .url-link:hover{text-decoration:underline}
 .badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:600}
@@ -651,18 +721,25 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 .msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
 .msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:24px}
+.divider{border:none;border-top:1px solid var(--border);margin:16px 0}
 </style>
 </head>
 <body>
 <div class="hdr">
-  <h1>Painel Admin — Cadastro de Rastreamentos</h1>
-  <a href="/dashboard">← Ver Dashboard</a>
+  <h1>⚙️ Admin — Nutra Monitor</h1>
+  <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
+    <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
+    <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
+  </div>
 </div>
 
-<div class="card">
-  <h2>➕ Cadastrar novo rastreamento</h2>
-  <form method="POST" action="/admin/salvar">
-    <div class="form-grid">
+${msgOk}
+
+<div class="card" id="form-card">
+  <h2 id="form-title">➕ Cadastrar novo rastreamento</h2>
+  <form method="POST" action="/admin/salvar" id="mainForm">
+    <input type="hidden" name="original_slug" id="originalSlug" value="">
+    <div class="form-row">
       <div class="field">
         <label>Tipo</label>
         <select name="tipo" id="tipoSelect" onchange="atualizarDica()">
@@ -672,17 +749,40 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
       </div>
       <div class="field">
         <label>Nome</label>
-        <input type="text" name="nome" placeholder="Ex: Protaflo ou SYNTROHEALTH.SITE" required>
+        <input type="text" name="nome" id="nomeInput" placeholder="Ex: FlowForce Max ou FLOWFORCE.COM" required>
       </div>
-      <button type="submit" class="btn">Cadastrar</button>
+      <div class="field">
+        <label>URL da Meta Ad Library</label>
+        <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+      </div>
     </div>
-    <div class="field" style="margin-top:12px">
-      <label>URL da Meta Ad Library</label>
-      <input type="url" name="url" id="urlInput" placeholder="https://www.facebook.com/ads/library/..." required>
+
+    <hr class="divider">
+    <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">Informações adicionais <span style="font-weight:400;text-transform:none;letter-spacing:0;opacity:.6">(opcionais)</span></div>
+
+    <div class="form-row-3">
+      <div class="field">
+        <label>Instagram <span class="label-optional">opcional</span></label>
+        <input type="url" name="instagram_url" id="instagramInput" placeholder="https://www.instagram.com/perfil">
+      </div>
+      <div class="field">
+        <label>Geo <span class="label-optional">opcional</span></label>
+        <input type="text" name="geo" id="geoInput" placeholder="Ex: US, BR, UK">
+      </div>
+      <div class="field">
+        <label>Nicho <span class="label-optional">opcional</span></label>
+        <input type="text" name="nicho" id="nichoInput" placeholder="Ex: Próstata, Weight Loss, ED">
+      </div>
     </div>
+
+    <div style="display:flex;gap:10px;margin-top:4px">
+      <button type="submit" class="btn" id="submitBtn">Cadastrar</button>
+      <button type="button" class="btn" id="cancelBtn" style="display:none;background:transparent;border:1px solid var(--border);color:var(--text2)" onclick="cancelarEdicao()">Cancelar edição</button>
+    </div>
+
     <div class="tip" id="dica">
-      💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>
-      Exemplo: <code>https://www.facebook.com/ads/library/?id=XXXXXXXXX</code>
+      💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>
+      Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>
     </div>
   </form>
 </div>
@@ -691,14 +791,20 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
   <h2>📦 Cadastro em lote</h2>
   <form method="POST" action="/admin/lote">
     <div class="field">
-      <label>Uma linha por item — formato: Nome | URL da Meta Ad Library</label>
-      <textarea name="itens" rows="6" placeholder="SYNTROHEALTH.SITE | https://www.facebook.com/ads/library/?q=%22SYNTROHEALTH.SITE%22...&#10;Protaflo Official | https://www.facebook.com/ads/library/?view_all_page_id=777074442148556" style="background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;padding:12px 14px;outline:none;resize:vertical;width:100%"></textarea>
+      <label>Uma linha por item</label>
+      <textarea name="itens" rows="7"
+        placeholder="FlowForce Max | https://www.facebook.com/ads/library/?view_all_page_id=123456 | https://instagram.com/flowforcemax&#10;FLOWFORCE.COM | https://www.facebook.com/ads/library/?q=FLOWFORCE.COM...&#10;dominio | AnotherOffer | https://www.facebook.com/ads/library/?q=ANOTHEROFFER.COM | https://instagram.com/anotheroffer"
+        style="background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;padding:12px 14px;outline:none;resize:vertical;width:100%"></textarea>
     </div>
     <button type="submit" class="btn" style="margin-top:12px">Cadastrar lote</button>
     <div class="tip">
-      💡 O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL — não precisa informar.<br>
-      Cada item leva ~15-20s pra processar. Recomendado: até 20 itens por lote no plano gratuito do Render.<br>
-      A página não precisa ficar aberta — o processamento continua em segundo plano no servidor.
+      💡 Formatos aceitos por linha:<br>
+      <code>Nome | URL da Meta Ad Library</code><br>
+      <code>Nome | URL da Meta Ad Library | https://instagram.com/perfil</code><br>
+      <code>tipo | Nome | URL | https://instagram.com/perfil</code><br><br>
+      O tipo (Biblioteca ou Domínio) é detectado automaticamente pela URL. O Instagram é opcional — basta omitir.<br>
+      Geo e Nicho só podem ser preenchidos após o cadastro, editando o item individualmente no admin.<br>
+      Cada item leva ~15-20s pra processar. A página não precisa ficar aberta.
     </div>
   </form>
   <div id="lote-progresso" style="display:none;margin-top:16px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:14px 16px">
@@ -714,7 +820,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
   <h2>📋 Rastreamentos cadastrados (${pages.length})</h2>
   ${pages.length === 0 ? '<div class="empty">Nenhum rastreamento cadastrado ainda.</div>' : `
   <table>
-    <thead><tr><th>Tipo</th><th>Nome</th><th>Link</th><th>Cadastrado</th><th></th></tr></thead>
+    <thead><tr><th>Tipo</th><th>Nome / Metadados</th><th>Link Meta</th><th>Cadastrado</th><th></th></tr></thead>
     <tbody>${lista}</tbody>
   </table>`}
 </div>
@@ -725,94 +831,128 @@ function atualizarDica(){
   const dica=document.getElementById('dica');
   const url=document.getElementById('urlInput');
   if(tipo==='dominio'){
-    dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
+    dica.innerHTML='💡 <strong>Domínio:</strong> Cole a URL de busca por palavra-chave/domínio na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM&search_type=keyword_unordered</code>';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&q=SEUDOMINIO.COM...';
   }else{
-    dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library.<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
+    dica.innerHTML='💡 <strong>Biblioteca:</strong> Cole a URL da página do anunciante na Meta Ad Library com filtro "Anúncios ativos".<br>Exemplo: <code>https://www.facebook.com/ads/library/?active_status=active&ad_type=all&id=XXXXXXXXX</code>';
     url.placeholder='https://www.facebook.com/ads/library/?active_status=active&id=...';
   }
 }
 
-// FIX #5: acompanha o progresso do lote sem precisar recarregar a página.
-// Se a URL veio com ?lote=iniciado (redirect do POST /admin/lote), começa
-// a checar /api/lote/status a cada 3s até o lote terminar.
+function editarItem(btn){
+  document.getElementById('originalSlug').value=btn.dataset.slug;
+  document.getElementById('nomeInput').value=btn.dataset.nome;
+  document.getElementById('urlInput').value=btn.dataset.url;
+  document.getElementById('tipoSelect').value=btn.dataset.tipo;
+  document.getElementById('instagramInput').value=btn.dataset.instagram;
+  document.getElementById('geoInput').value=btn.dataset.geo;
+  document.getElementById('nichoInput').value=btn.dataset.nicho;
+  document.getElementById('form-title').textContent='✏️ Editando: '+btn.dataset.nome;
+  document.getElementById('submitBtn').textContent='Salvar alterações';
+  document.getElementById('cancelBtn').style.display='inline-block';
+  atualizarDica();
+  document.getElementById('form-card').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function cancelarEdicao(){
+  document.getElementById('mainForm').reset();
+  document.getElementById('originalSlug').value='';
+  document.getElementById('form-title').textContent='➕ Cadastrar novo rastreamento';
+  document.getElementById('submitBtn').textContent='Cadastrar';
+  document.getElementById('cancelBtn').style.display='none';
+  atualizarDica();
+}
+
 (function iniciarPollingLote(){
-  const params = new URLSearchParams(window.location.search);
-  const painel = document.getElementById('lote-progresso');
-  const texto = document.getElementById('lote-texto');
-  const barra = document.getElementById('lote-barra');
-  const errosEl = document.getElementById('lote-erros');
-  if (!painel) return;
-
+  const params=new URLSearchParams(window.location.search);
+  const painel=document.getElementById('lote-progresso');
+  const texto=document.getElementById('lote-texto');
+  const barra=document.getElementById('lote-barra');
+  const errosEl=document.getElementById('lote-erros');
+  if(!painel)return;
   async function checarStatus(){
-    try {
-      const r = await fetch('/api/lote/status');
-      const s = await r.json();
-      if (!s.emAndamento && !s.total) return; // nenhum lote rodou ainda
-      painel.style.display = 'block';
-      const pct = s.total ? Math.round((s.concluidos / s.total) * 100) : 0;
-      barra.style.width = pct + '%';
-      if (s.emAndamento) {
-        texto.textContent = 'Processando ' + s.concluidos + ' de ' + s.total + '... atual: ' + (s.atual || '—');
-        setTimeout(checarStatus, 3000);
-      } else {
-        texto.textContent = 'Lote finalizado — ' + s.concluidos + ' de ' + s.total + ' itens processados.';
-        if (s.erros && s.erros.length) {
-          errosEl.innerHTML = s.erros.map(e => '⚠️ ' + e).join('<br>');
-        }
+    try{
+      const r=await fetch('/api/lote/status');
+      const s=await r.json();
+      if(!s.emAndamento&&!s.total)return;
+      painel.style.display='block';
+      const pct=s.total?Math.round((s.concluidos/s.total)*100):0;
+      barra.style.width=pct+'%';
+      if(s.emAndamento){
+        texto.textContent='Processando '+s.concluidos+' de '+s.total+'... atual: '+(s.atual||'—');
+        setTimeout(checarStatus,3000);
+      }else{
+        texto.textContent='Lote finalizado — '+s.concluidos+' de '+s.total+' itens processados.';
+        if(s.erros&&s.erros.length){errosEl.innerHTML=s.erros.map(e=>'⚠️ '+e).join('<br>');}
       }
-    } catch (e) {
-      console.error('Falha ao consultar status do lote', e);
-    }
+    }catch(e){console.error('Falha ao consultar status do lote',e);}
   }
-
-  if (params.get('lote') === 'iniciado') {
-    checarStatus();
-  } else {
-    // Ao abrir a página normalmente, checa uma vez se sobrou algum lote
-    // em andamento (ex: você fechou a aba e voltou depois).
-    checarStatus();
-  }
+  if(params.get('lote')==='iniciado'){checarStatus();}else{checarStatus();}
 })();
 </script>
 </body>
 </html>`);
 });
 
-// Rota que processa o form de cadastro
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
+  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
+
+  // Modo edição: atualiza o registro existente pelo slug original — o slug NUNCA muda,
+  // mesmo que o nome de exibição mude, para preservar o vínculo com scrape_history/scrape_latest.
+  if (original_slug && original_slug.trim()) {
+    try {
+      const { rowCount } = await query(
+        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7 WHERE slug=$8`,
+        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, original_slug.trim()]
+      );
+      if (rowCount === 0) {
+        console.warn(`[ADMIN] edição falhou — slug=${original_slug} não encontrado`);
+        return res.redirect("/admin?erro=erro-interno");
+      }
+      console.log(`[ADMIN] editou slug=${original_slug}`);
+      return res.redirect("/admin?ok=editado");
+    } catch (err) {
+      console.error("[ADMIN] erro ao editar:", err.message);
+      return res.redirect("/admin?erro=erro-interno");
+    }
+  }
+
+  // Modo cadastro (novo item)
   const slug = toSlug(nome);
   if (!slug) return res.redirect("/admin?erro=nome-invalido");
-  const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   try {
     await query(
-      `INSERT INTO pages (slug, nome, url, tipo) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (slug) DO UPDATE SET nome=$2, url=$3, tipo=$4`,
-      [slug, nome, url, tipoFinal]
+      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (slug) DO UPDATE
+         SET nome=$2, url=$3, tipo=$4,
+             instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
+             geo=COALESCE(EXCLUDED.geo, pages.geo),
+             nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
+             funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
     );
     console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
-    await captureInicial(slug, url); // FIX #4: grava Descoberta+Inicial na hora (15-30s de espera)
+    await captureInicial(slug, url);
     res.redirect("/admin?ok=1");
-  } catch(err) {
+  } catch (err) {
     console.error("[ADMIN] erro:", err.message);
     res.redirect("/admin?erro=erro-interno");
   }
 });
 
-// Rota que processa remoção
 app.post("/admin/remover", async (req, res) => {
   const { slug } = req.body;
   if (!slug) return res.redirect("/admin");
   await query("DELETE FROM pages WHERE slug=$1", [slug]);
+  await query("DELETE FROM scrape_history WHERE slug=$1", [slug]);
+  await query("DELETE FROM scrape_latest WHERE slug=$1", [slug]);
   console.log(`[ADMIN] removeu slug=${slug}`);
   res.redirect("/admin?ok=removido");
 });
 
-// FIX #5: dispara o lote e responde IMEDIATAMENTE (padrão idêntico ao
-// /api/coletar-tudo) — quem está processando de verdade é a runLote() lá
-// atrás, rodando em segundo plano depois que o redirect já foi enviado.
 app.post("/admin/lote", async (req, res) => {
   const { itens: textoItens } = req.body;
   if (!textoItens || !textoItens.trim()) return res.redirect("/admin?erro=lote-vazio");
@@ -823,37 +963,971 @@ app.post("/admin/lote", async (req, res) => {
   runLote(itens).catch((err) => console.error("[LOTE] erro não tratado:", err.message));
 });
 
-// Consultado via polling pelo JS da página /admin enquanto o lote roda.
 app.get("/api/lote/status", (_req, res) => {
   res.json(loteStatus);
 });
 
+// ─── Funis (modelo de grafo: nós + conexões) ────────────────────────────────
+
+const TIPO_INFO = {
+  advertorial: { icon: "📄", label: "Advertorial" },
+  tsl:         { icon: "📝", label: "TSL" },
+  vsl:         { icon: "🎬", label: "VSL" },
+  quiz:        { icon: "🧩", label: "Quiz" },
+  whatsapp:    { icon: "💬", label: "WhatsApp" },
+  checkout:    { icon: "💳", label: "Checkout" },
+};
+const TIPOS_ORDEM = ["advertorial", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
+
+// Computa todos os caminhos (raiz → folha) de um grafo de nós/conexões.
+// Raiz = nó sem conexão de entrada. Folha = nó sem conexão de saída.
+// Guarda contra ciclos interrompendo o caminho se o nó já apareceu nele.
+function computarCaminhos(nodes, edges) {
+  const nodesById = {};
+  nodes.forEach(n => { nodesById[n.id] = n; });
+
+  const adjOut = {};
+  const adjIn = {};
+  const adjUndir = {};
+  nodes.forEach(n => {
+    adjOut[n.id] = [];
+    adjIn[n.id] = [];
+    adjUndir[n.id] = [];
+  });
+  edges.forEach(e => {
+    if (adjOut[e.from_node_id] && adjIn[e.to_node_id]) {
+      adjOut[e.from_node_id].push(e.to_node_id);
+      adjIn[e.to_node_id].push(e.from_node_id);
+      adjUndir[e.from_node_id].push(e.to_node_id);
+      adjUndir[e.to_node_id].push(e.from_node_id);
+    }
+  });
+
+  const visited = new Set();
+  const componentes = [];
+  nodes.forEach(n => {
+    if (visited.has(n.id)) return;
+    if (adjUndir[n.id].length === 0) return;
+    const comp = [];
+    const queue = [n.id];
+    visited.add(n.id);
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      comp.push(curr);
+      adjUndir[curr].forEach(nxt => {
+        if (!visited.has(nxt)) {
+          visited.add(nxt);
+          queue.push(nxt);
+        }
+      });
+    }
+    if (comp.length >= 2) componentes.push(comp);
+  });
+
+  const funisMapeados = [];
+  componentes.forEach(comp => {
+    const compSet = new Set(comp);
+    let raizes = comp.filter(id => adjIn[id].filter(x => compSet.has(x)).length === 0);
+    if (raizes.length === 0) raizes = [comp[0]];
+
+    const levels = [];
+    const assigned = new Set();
+    let currentLevel = [...raizes];
+    currentLevel.forEach(id => assigned.add(id));
+
+    while (currentLevel.length > 0) {
+      levels.push(currentLevel.map(id => nodesById[id]).filter(Boolean));
+      const nextLevelSet = new Set();
+      currentLevel.forEach(id => {
+        adjOut[id].forEach(nxt => {
+          if (compSet.has(nxt) && !assigned.has(nxt)) {
+            nextLevelSet.add(nxt);
+          }
+        });
+      });
+      currentLevel = Array.from(nextLevelSet);
+      currentLevel.forEach(id => assigned.add(id));
+    }
+
+    const remaining = comp.filter(id => !assigned.has(id)).map(id => nodesById[id]).filter(Boolean);
+    if (remaining.length > 0) {
+      if (levels.length > 0) levels[levels.length - 1].push(...remaining);
+      else levels.push(remaining);
+    }
+
+    function buildTree(id, treeVisited = new Set()) {
+      if (treeVisited.has(id)) return null;
+      treeVisited.add(id);
+      const node = nodesById[id];
+      if (!node) return null;
+      const childrenIds = (adjOut[id] || []).filter(nxt => compSet.has(nxt));
+      const children = childrenIds
+        .map(cid => buildTree(cid, new Set(treeVisited)))
+        .filter(Boolean);
+      return { node, children };
+    }
+
+    const rootTrees = raizes.map(rid => buildTree(rid)).filter(Boolean);
+    const mainTree = rootTrees.length === 1 ? rootTrees[0] : { node: null, children: rootTrees };
+
+    funisMapeados.push({
+      tree: mainTree,
+      levels: levels,
+      allNodes: comp.map(id => nodesById[id]).filter(Boolean)
+    });
+  });
+
+  return funisMapeados;
+}
+
+async function getNodesEdges(slug) {
+  const { rows: nodes } = await query(
+    `SELECT id, tipo, rotulo, url FROM funnel_nodes WHERE slug=$1 ORDER BY created_at ASC`, [slug]
+  );
+  let edges = [];
+  if (nodes.length) {
+    const ids = nodes.map(n => n.id);
+    const { rows } = await query(
+      `SELECT id, from_node_id, to_node_id FROM funnel_edges WHERE from_node_id = ANY($1) OR to_node_id = ANY($1)`,
+      [ids]
+    );
+    edges = rows;
+  }
+  return { nodes, edges };
+}
+
+function renderChip(node) {
+  const info = TIPO_INFO[node.tipo] || { icon: "🔗", label: node.tipo };
+  return `<a href="${node.url}" target="_blank" rel="noopener" class="chip" title="Abrir ${node.rotulo} em nova guia">
+    <span class="chip-icon">${info.icon}</span>
+    <span class="chip-label">${node.rotulo}</span>
+  </a>`;
+}
+
+function renderNotionLinearConnector() {
+  return `<span class="flow-notion-arrow" style="display:inline-flex;align-items:center;margin:0 6px;flex-shrink:0">
+    <svg width="24" height="12" viewBox="0 0 24 12" fill="none">
+      <line x1="0" y1="6" x2="18" y2="6" stroke="#7c6fff" stroke-width="2" stroke-linecap="round"/>
+      <path d="M15 2L20 6L15 10" stroke="#7c6fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </span>`;
+}
+
+function renderNotionBranchConnector() {
+  return `<span class="flow-branch-arrow" style="display:inline-flex;align-items:center;margin-right:6px;flex-shrink:0">
+    <svg width="10" height="12" viewBox="0 0 10 12" fill="none">
+      <path d="M1 2L6 6L1 10" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </span>`;
+}
+
+function renderTreeNode(treeNode) {
+  if (!treeNode) return "";
+  if (!treeNode.node && treeNode.children) {
+    return treeNode.children.map(renderTreeNode).join("");
+  }
+  const chipHtml = renderChip(treeNode.node);
+  if (!treeNode.children || treeNode.children.length === 0) {
+    return `<div class="flow-tree-node">${chipHtml}</div>`;
+  }
+  if (treeNode.children.length === 1) {
+    return `<div class="flow-tree-node">${chipHtml}<div class="flow-linear-branch">${renderNotionLinearConnector()}${renderTreeNode(treeNode.children[0])}</div></div>`;
+  }
+  const branchesHtml = treeNode.children.map(child => `
+    <div class="flow-tree-branch">
+      ${renderNotionBranchConnector()}
+      <div class="flow-branch-content">
+        ${renderTreeNode(child)}
+      </div>
+    </div>
+  `).join("");
+
+  return `<div class="flow-tree-node">${chipHtml}<div class="flow-tree-branches">${branchesHtml}</div></div>`;
+}
+
+function renderCaminho(funilItem, idx = 0, isEditMode = false, explicitSlug = "") {
+  let tree, levels, allNodes;
+  if (funilItem && funilItem.tree) {
+    tree = funilItem.tree;
+    levels = funilItem.levels;
+    allNodes = funilItem.allNodes;
+  } else if (Array.isArray(funilItem)) {
+    levels = Array.isArray(funilItem[0]) ? funilItem : funilItem.map(n => [n]);
+    allNodes = levels.flat();
+    tree = { node: allNodes[0], children: [] };
+  } else {
+    return "";
+  }
+
+  const slug = explicitSlug || allNodes[0]?.slug || "";
+  const label = allNodes.map(n => n.rotulo).join(' \u2192 ');
+  const levelsJson = JSON.stringify(levels.map(lvl => lvl.map(n => n.id)));
+  const allIdsJson = JSON.stringify(allNodes.map(n => n.id));
+
+  const treeHtml = renderTreeNode(tree);
+
+  if (!isEditMode) {
+    return `<div class="caminho-row flow-row-container" style="display:flex;align-items:center;overflow-x:auto;padding:14px 16px">
+      ${treeHtml}
+    </div>`;
+  }
+
+  return `<div class="caminho-row flow-row-container" style="display:flex;align-items:center;justify-content:space-between;gap:16px;overflow-x:auto;padding:14px 16px">
+    <div style="display:flex;align-items:center">
+      ${treeHtml}
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0">
+      <button type="button" class="btn-edit-sm" onclick='editarFunil(${levelsJson})' title="Editar este funil no construtor">\u270F\uFE0F Editar</button>
+      <form id="form-rem-caminho-${idx}" method="POST" action="/admin/funis/remover-caminho" style="display:none">
+        <input type="hidden" name="slug" value="${slug}">
+        <input type="hidden" name="funil_node_ids" value='${allIdsJson}'>
+      </form>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('caminho', ${idx}, 'Excluir funil mapeado', '${label.replace(/'/g, "\\'")}')">\u2715 Excluir</button>
+    </div>
+  </div>`;
+}
+
+// Página de gerenciamento de nós/conexões de um player
+app.get("/admin/funis/:slug", async (req, res) => {
+  const { slug } = req.params;
+  const { rows: pages } = await query("SELECT nome, url FROM pages WHERE slug=$1 LIMIT 1", [slug]);
+  if (!pages.length) return res.status(404).send("Player não encontrado.");
+  const nomePage = pages[0].nome;
+
+  const { nodes, edges } = await getNodesEdges(slug);
+  const nodesById = {};
+  nodes.forEach(n => { nodesById[n.id] = n; });
+
+  const optionsNodes = nodes.map(n => {
+    const info = TIPO_INFO[n.tipo] || { icon: "🔗", label: n.tipo };
+    return `<option value="${n.id}">${info.icon} ${n.rotulo} (${info.label})</option>`;
+  }).join("");
+
+  const optionsTipos = TIPOS_ORDEM.map(t => `<option value="${t}">${TIPO_INFO[t].icon} ${TIPO_INFO[t].label}</option>`).join("");
+
+  const listaNodes = nodes.length ? nodes.map(n => {
+    const info = TIPO_INFO[n.tipo] || { icon: "🔗", label: n.tipo };
+    return `<div class="node-row">
+      <span class="node-tipo">${info.icon} ${info.label}</span>
+      <span class="node-rotulo">${n.rotulo}</span>
+      <a href="${n.url}" target="_blank" class="node-url">${n.url.length > 45 ? n.url.slice(0,45)+'...' : n.url}</a>
+      <form id="form-rem-node-${n.id}" method="POST" action="/admin/funis/remover-node" style="display:none">
+        <input type="hidden" name="node_id" value="${n.id}">
+        <input type="hidden" name="slug" value="${slug}">
+      </form>
+      <button type="button" class="btn-del-sm" onclick="abrirModalRemover('node', ${n.id}, 'Remover etapa', '${n.rotulo.replace(/'/g, "\\'")}')">✕</button>
+    </div>`;
+  }).join("") : '<div class="empty-hint-sm">Nenhuma etapa cadastrada ainda. Crie a primeira acima.</div>';
+
+  const listaEdges = edges.length ? edges.map(e => {
+    const de = nodesById[e.from_node_id], para = nodesById[e.to_node_id];
+    if (!de || !para) return "";
+    const label = de.rotulo + ' \u2192 ' + para.rotulo;
+    return `<div class="edge-row">
+      ${renderChip(de)}<span class="chip-arrow">→</span>${renderChip(para)}
+      <form id="form-rem-${e.id}" method="POST" action="/admin/funis/remover-edge" style="display:none">
+        <input type="hidden" name="edge_id" value="${e.id}">
+        <input type="hidden" name="slug" value="${slug}">
+      </form>
+      <button type="button" class="btn-del-sm" style="margin-left:auto"
+        onclick="abrirModalRemover(${e.id},'${label.replace(/'/g, "\\'")}')">&#x2715;</button>
+    </div>`;
+  }).join("") : '<div class="empty-hint-sm">Nenhuma conexão criada ainda.</div>';
+
+  const caminhos = computarCaminhos(nodes, edges);
+  const previaCaminhos = caminhos.length
+    ? caminhos.map((c, idx) => renderCaminho(c, idx, true, slug)).join("")
+    : '<div class="empty-hint-sm">Cadastre etapas e conecte-as para ver os funis mapeados aqui.</div>';
+
+  const msgOk = (() => {
+    const q = req.query;
+    if (q.ok === "node-add") return '<div class="msg ok">✅ Etapa criada.</div>';
+    if (q.ok === "node-rem") return '<div class="msg ok">🗑️ Etapa removida.</div>';
+    if (q.ok === "edge-add") return '<div class="msg ok">✅ Conexão criada.</div>';
+    if (q.ok === "edge-rem") return '<div class="msg ok">🗑️ Conexão removida.</div>';
+    if (q.erro === "sem-etapas") return '<div class="msg err">⚠️ Cadastre pelo menos 2 etapas antes de conectar.</div>';
+    if (q.erro === "mesma-etapa") return '<div class="msg err">⚠️ Uma etapa não pode se conectar a ela mesma.</div>';
+    return "";
+  })();
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Funil — ${nomePage}</title>
+<style>
+:root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:900px;margin:0 auto}
+.hdr{display:flex;align-items:center;gap:14px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.hdr h1{font-size:17px;font-weight:700}
+.hdr-sub{font-size:12px;color:var(--muted);margin-top:3px}
+.hdr-nav{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.hdr-nav a{font-size:12px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px;white-space:nowrap}
+.hdr-nav a:hover{background:var(--accent);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 22px;margin-bottom:18px}
+.card h2{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:16px}
+.field{display:flex;flex-direction:column;gap:6px}
+label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+input,select{background:#0f0f1e;border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;padding:9px 13px;outline:none;transition:border-color .2s}
+input:focus,select:focus{border-color:var(--accent)}
+input::placeholder{color:var(--muted)}
+.form-row{display:grid;grid-template-columns:180px 160px 1fr auto;gap:10px;align-items:end}
+.form-row-edge{display:grid;grid-template-columns:1fr auto 1fr auto;gap:10px;align-items:end}
+.chain-builder{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px}
+.chain-elo{display:flex;flex-direction:column;gap:6px;min-width:165px;flex:1}
+.elo-selects{display:flex;flex-direction:column;gap:6px}
+.btn-elo-bifurcar{background:transparent;color:#a78bfa;border:1px dashed rgba(167,139,250,0.35);border-radius:6px;font-size:11px;font-weight:600;padding:5px 8px;cursor:pointer;margin-top:2px;width:100%;transition:all .15s}
+.btn-elo-bifurcar:hover{background:rgba(167,139,250,0.12);border-color:#a78bfa;color:#fff}
+.funil-seta-apple{display:inline-flex;align-items:center;color:#a78bfa;margin:0 5px;opacity:0.85}
+.funil-seta-apple svg{display:block;filter:drop-shadow(0 0 4px rgba(167,139,250,0.4))}
+.chain-arrow{color:var(--muted);font-size:16px;padding-bottom:10px;flex-shrink:0}
+.btn-chain-add{background:transparent;color:var(--accent);border:1px solid var(--accent);border-radius:6px;font-size:18px;font-weight:700;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0;margin-bottom:1px}
+.btn-chain-add:hover{background:var(--accent);color:#fff}
+.btn-chain-rem{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:12px;width:32px;height:36px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:1;transition:all .15s;padding:0;margin-bottom:1px}
+.btn-chain-rem:hover{color:var(--down);border-color:var(--down)}
+@media(max-width:700px){.form-row,.form-row-edge{grid-template-columns:1fr}.chain-builder{flex-direction:column}}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;padding:9px 20px;cursor:pointer;white-space:nowrap}
+.btn:hover{opacity:.85}
+.btn-del-sm{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:11px;padding:5px 10px;cursor:pointer;line-height:1.4;transition:all .15s}
+.btn-del-sm:hover{color:var(--down);border-color:var(--down);background:rgba(251,113,133,.08)}
+.btn-edit-sm{background:rgba(167,139,250,.12);color:#a78bfa;border:1px solid rgba(167,139,250,.3);border-radius:6px;font-size:11px;padding:5px 10px;cursor:pointer;line-height:1.4;transition:all .15s;font-weight:600}
+.btn-edit-sm:hover{background:var(--accent);color:#fff}
+.btn-insert-mid{background:transparent;color:var(--accent);border:1px dashed var(--accent);border-radius:5px;font-size:11px;font-weight:700;padding:2px 7px;cursor:pointer;line-height:1.2;transition:all .15s}
+.btn-insert-mid:hover{background:var(--accent);color:#fff}
+.node-row{display:flex;align-items:center;gap:10px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:9px 12px;margin-bottom:8px;flex-wrap:wrap}
+.node-tipo{font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 9px;border-radius:5px;white-space:nowrap}
+.node-rotulo{font-size:13px;font-weight:700;color:#fff}
+.node-url{font-size:11px;color:var(--accent);text-decoration:none;font-family:'Space Mono',monospace;margin-left:auto}
+.node-url:hover{text-decoration:underline}
+.edge-row{display:flex;align-items:center;gap:6px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:9px 12px;margin-bottom:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
+.chip:hover{border-color:var(--accent)}
+.chip-icon{font-size:13px}
+.chip-arrow{color:var(--muted);font-size:15px;font-weight:700;margin:0 2px}
+.caminho-row{display:flex;align-items:center;flex-wrap:wrap;gap:2px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:8px}
+.flow-tree-node{display:inline-flex;align-items:center}
+.flow-linear-branch{display:inline-flex;align-items:center}
+.flow-tree-branches{display:flex;flex-direction:column;justify-content:center;gap:12px;position:relative;margin-left:8px;padding-left:18px}
+.flow-tree-branches::before{content:'';position:absolute;left:0;top:16px;bottom:16px;width:2px;background:rgba(167,139,250,0.45);border-radius:2px}
+.flow-tree-branch{display:inline-flex;align-items:center;position:relative}
+.flow-tree-branch::before{content:'';position:absolute;left:-18px;top:50%;width:12px;height:2px;background:rgba(167,139,250,0.45)}
+.flow-branch-content{display:inline-flex;align-items:center}
+.flow-row-container{min-height:54px}
+.empty-hint-sm{color:var(--muted);font-size:12px;text-align:center;padding:16px;border:1px dashed var(--border);border-radius:8px}
+.msg{padding:11px 14px;border-radius:8px;font-size:13px;margin-bottom:16px}
+.msg.ok{background:rgba(52,211,153,.12);color:#34d399;border:1px solid rgba(52,211,153,.25)}
+.msg.err{background:rgba(251,113,133,.12);color:#fb7185;border:1px solid rgba(251,113,133,.25)}
+.divider{border:none;border-top:1px solid var(--border);margin:14px 0}
+/* Modal Apple-style */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center;z-index:9999;opacity:0;pointer-events:none;transition:opacity .2s ease}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-card{background:#1c1c2e;border:1px solid rgba(255,255,255,.1);border-radius:20px;padding:30px 28px 24px;max-width:340px;width:calc(100% - 40px);box-shadow:0 40px 100px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.06);transform:scale(.92) translateY(12px);transition:transform .28s cubic-bezier(.34,1.4,.64,1),opacity .22s ease;opacity:0;text-align:center}
+.modal-overlay.open .modal-card{transform:scale(1) translateY(0);opacity:1}
+.modal-icon{font-size:38px;margin-bottom:14px;line-height:1}
+.modal-title{font-size:16px;font-weight:700;color:#fff;margin-bottom:8px;letter-spacing:-.2px}
+.modal-desc{font-size:13px;color:#8888aa;margin-bottom:24px;line-height:1.6;word-break:break-all}
+.modal-actions{display:flex;gap:10px}
+.modal-btn-cancel{flex:1;background:rgba(255,255,255,.07);color:#e0e0f0;border:1px solid rgba(255,255,255,.1);border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:600;padding:12px 0;cursor:pointer;transition:background .15s}
+.modal-btn-cancel:hover{background:rgba(255,255,255,.13)}
+.modal-btn-confirm{flex:1;background:#fb7185;color:#fff;border:none;border-radius:12px;font-family:'Space Grotesk',sans-serif;font-size:14px;font-weight:700;padding:12px 0;cursor:pointer;transition:background .15s,transform .1s}
+.modal-btn-confirm:hover{background:#f43f5e}
+.modal-btn-confirm:active{transform:scale(.97)}
+</style>
+</head>
+<body>
+<!-- Modal Apple-style universal -->
+<div class="modal-overlay" id="modal-remover-apple" onclick="fecharModalAppleOverlay(event)">
+  <div class="modal-card">
+    <div class="modal-icon">🗑️</div>
+    <h3 class="modal-title" id="modal-apple-title">Confirmar exclusão</h3>
+    <p class="modal-desc" id="modal-apple-desc"></p>
+    <div class="modal-actions">
+      <button class="modal-btn-cancel" onclick="fecharModalApple()">Cancelar</button>
+      <button class="modal-btn-confirm" onclick="confirmarRemoverApple()">Excluir</button>
+    </div>
+  </div>
+</div>
+<div class="hdr">
+  <div>
+    <h1>🔀 Funil — ${nomePage}</h1>
+    <div class="hdr-sub">Mapeamento de etapas e conexões</div>
+  </div>
+  <div class="hdr-nav">
+    <a href="/admin">⚙️ Admin</a>
+    <a href="/dashboard">📊 Dashboard</a>
+    <a href="/funis">🔀 Ver Mapa de Funis</a>
+  </div>
+</div>
+
+${msgOk}
+
+<div class="card">
+  <h2>➕ Nova etapa</h2>
+  <form method="POST" action="/admin/funis/add-node">
+    <input type="hidden" name="slug" value="${slug}">
+    <div class="form-row">
+      <div class="field"><label>Tipo</label><select name="tipo">${optionsTipos}</select></div>
+      <div class="field"><label>Rótulo</label><input type="text" name="rotulo" placeholder="Ex: TSL2, Checkout1" required></div>
+      <div class="field"><label>URL</label><input type="url" name="url" placeholder="https://..." required></div>
+      <button type="submit" class="btn">Adicionar</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>📋 Etapas cadastradas (${nodes.length})</h2>
+  ${listaNodes}
+</div>
+
+<div class="card" id="card-conectar-etapas">
+  <h2>🔗 Conectar etapas</h2>
+  ${nodes.length < 2
+    ? '<div class="empty-hint-sm">Cadastre pelo menos 2 etapas para poder conectá-las.</div>'
+    : `<form method="POST" action="/admin/funis/add-edge" id="form-add-edge">
+        <input type="hidden" name="slug" value="${slug}">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:12px;line-height:1.5">
+          Monte a sequência completa do funil. Cada etapa conecta à próxima em cadeia.
+        </div>
+        <input type="hidden" name="chain_steps_json" id="chain_steps_json">
+        <div class="chain-builder" id="chain-builder">
+          <div class="chain-elo">
+            <label>Etapa 1</label>
+            <div class="elo-selects">
+              <select name="chain_ids[]">${optionsNodes}</select>
+            </div>
+            <button type="button" class="btn-elo-bifurcar" onclick="bifurcarElo(this)" title="Adicionar bifurcação nesta etapa">🔀 Bifurcar</button>
+          </div>
+          <div class="chain-arrow" id="chain-arrow-1">→</div>
+          <div class="chain-elo" id="chain-elo-2">
+            <label>Etapa 2</label>
+            <div class="elo-selects">
+              <select name="chain_ids[]">${optionsNodes}</select>
+            </div>
+            <button type="button" class="btn-elo-bifurcar" onclick="bifurcarElo(this)" title="Adicionar bifurcação nesta etapa">🔀 Bifurcar</button>
+          </div>
+          <button type="button" class="btn-chain-add" id="btn-chain-add" onclick="adicionarElo()" title="Adicionar próxima etapa na cadeia">+</button>
+        </div>
+        <div style="margin-top:14px;display:flex;justify-content:flex-end">
+          <button type="submit" class="btn">Conectar Cadeia</button>
+        </div>
+      </form>`}
+</div>
+
+<div class="card">
+  <h2>✨ FUNIS MAPEADOS (${caminhos.length})</h2>
+  ${previaCaminhos}
+</div>
+
+<script>
+var _chainCount=2;
+var _optionsHtml=(function(){
+  var sel=document.querySelector('#chain-builder select');
+  return sel?sel.innerHTML:'';
+})();
+function adicionarElo(val){
+  _chainCount++;
+  var builder=document.getElementById('chain-builder');
+  var addBtn=document.getElementById('btn-chain-add');
+  var arrow=document.createElement('div');
+  arrow.className='chain-arrow';
+  arrow.textContent='\u2192';
+  var elo=document.createElement('div');
+  elo.className='chain-elo';
+  elo.id='chain-elo-'+_chainCount;
+  var lbl=document.createElement('label');
+  lbl.textContent='Etapa '+_chainCount;
+  var selWrap=document.createElement('div');
+  selWrap.className='elo-selects';
+  var sel=document.createElement('select');
+  sel.name='chain_ids[]';
+  sel.innerHTML=_optionsHtml;
+  if(val) sel.value=val;
+  selWrap.appendChild(sel);
+  var bifBtn=document.createElement('button');
+  bifBtn.type='button';
+  bifBtn.className='btn-elo-bifurcar';
+  bifBtn.textContent='🔀 Bifurcar';
+  bifBtn.title='Adicionar bifurcação nesta etapa';
+  bifBtn.onclick=function(){bifurcarElo(bifBtn);};
+  var remBtn=document.createElement('button');
+  remBtn.type='button';
+  remBtn.className='btn-chain-rem';
+  remBtn.textContent='\u2715';
+  remBtn.title='Remover esta etapa';
+  remBtn.onclick=function(){arrow.remove();elo.remove();renumerarCadeia();};
+  elo.appendChild(lbl);
+  elo.appendChild(selWrap);
+  elo.appendChild(bifBtn);
+  builder.insertBefore(arrow,addBtn);
+  builder.insertBefore(elo,addBtn);
+  builder.insertBefore(remBtn,addBtn);
+}
+function bifurcarElo(btnEl){
+  var elo=btnEl.closest('.chain-elo');
+  var wrap=elo.querySelector('.elo-selects');
+  var row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:4px;margin-top:4px';
+  var sel=document.createElement('select');
+  sel.name='chain_ids[]';
+  sel.innerHTML=_optionsHtml;
+  var rm=document.createElement('button');
+  rm.type='button';
+  rm.className='btn-chain-rem';
+  rm.style.padding='2px 6px';
+  rm.textContent='\u2715';
+  rm.onclick=function(){row.remove();};
+  row.appendChild(sel);
+  row.appendChild(rm);
+  wrap.appendChild(row);
+}
+function renumerarCadeia(){
+  var elos=document.querySelectorAll('#chain-builder .chain-elo label');
+  elos.forEach(function(lbl, i){ lbl.textContent='Etapa '+(i+1); });
+}
+function editarFunil(levels){
+  var builder=document.getElementById('chain-builder');
+  if(!builder) return;
+  if(!Array.isArray(levels[0])) levels = levels.map(function(id){ return [id]; });
+  
+  builder.innerHTML = '';
+  _chainCount = 0;
+  levels.forEach(function(stepIds, idx){
+    if(idx > 0){
+      var arrow=document.createElement('div');
+      arrow.className='chain-arrow';
+      arrow.textContent='\u2192';
+      builder.appendChild(arrow);
+    }
+    _chainCount++;
+    var elo=document.createElement('div');
+    elo.className='chain-elo';
+    elo.id='chain-elo-'+_chainCount;
+    var lbl=document.createElement('label');
+    lbl.textContent='Etapa '+_chainCount;
+    var selWrap=document.createElement('div');
+    selWrap.className='elo-selects';
+    
+    stepIds.forEach(function(nodeId, sIdx){
+      var row=document.createElement('div');
+      row.style.cssText=sIdx===0 ? '' : 'display:flex;align-items:center;gap:4px;margin-top:4px';
+      var sel=document.createElement('select');
+      sel.name='chain_ids[]';
+      sel.innerHTML=_optionsHtml;
+      sel.value=nodeId;
+      if(sIdx===0){
+        selWrap.appendChild(sel);
+      } else {
+        var rm=document.createElement('button');
+        rm.type='button';
+        rm.className='btn-chain-rem';
+        rm.style.padding='2px 6px';
+        rm.textContent='\u2715';
+        rm.onclick=function(){row.remove();};
+        row.appendChild(sel);
+        row.appendChild(rm);
+        selWrap.appendChild(row);
+      }
+    });
+
+    var bifBtn=document.createElement('button');
+    bifBtn.type='button';
+    bifBtn.className='btn-elo-bifurcar';
+    bifBtn.textContent='🔀 Bifurcar';
+    bifBtn.onclick=function(){bifurcarElo(bifBtn);};
+
+    elo.appendChild(lbl);
+    elo.appendChild(selWrap);
+    elo.appendChild(bifBtn);
+
+    if(_chainCount > 2){
+      var remEloBtn=document.createElement('button');
+      remEloBtn.type='button';
+      remEloBtn.className='btn-chain-rem';
+      remEloBtn.textContent='\u2715';
+      remEloBtn.title='Remover esta etapa';
+      remEloBtn.onclick=function(){elo.previousSibling?.remove();elo.remove();renumerarCadeia();};
+      elo.appendChild(remEloBtn);
+    }
+
+    builder.appendChild(elo);
+  });
+
+  var addBtn=document.createElement('button');
+  addBtn.type='button';
+  addBtn.className='btn-chain-add';
+  addBtn.id='btn-chain-add';
+  addBtn.onclick=function(){adicionarElo();};
+  addBtn.textContent='+';
+  addBtn.title='Adicionar próxima etapa na cadeia';
+  builder.appendChild(addBtn);
+
+  var card=document.getElementById('card-conectar-etapas');
+  if(card){
+    card.scrollIntoView({behavior:'smooth',block:'center'});
+    card.style.transition='box-shadow 0.4s ease, border-color 0.4s ease';
+    card.style.borderColor='var(--accent)';
+    card.style.boxShadow='0 0 0 2px rgba(167,139,250,0.4)';
+    setTimeout(function(){ card.style.borderColor=''; card.style.boxShadow=''; }, 1500);
+  }
+}
+function editarCaminho(ids){ editarFunil(ids); }
+
+/* ── Modal Apple-style para remover ── */
+var _itemToRemove=null;
+function abrirModalRemover(tipo,id,titulo,descricao){
+  _itemToRemove={tipo:tipo, id:id};
+  document.getElementById('modal-apple-title').textContent=titulo;
+  document.getElementById('modal-apple-desc').textContent=descricao;
+  var m=document.getElementById('modal-remover-apple');
+  m.classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function fecharModalApple(){
+  var m=document.getElementById('modal-remover-apple');
+  m.classList.remove('open');
+  document.body.style.overflow='';
+}
+function fecharModalAppleOverlay(e){
+  if(e.target===document.getElementById('modal-remover-apple')) fecharModalApple();
+}
+function confirmarRemoverApple(){
+  if(!_itemToRemove) return;
+  sessionStorage.setItem('funil_scroll_y', window.scrollY);
+  var frm = document.getElementById('form-rem-'+_itemToRemove.tipo+'-'+_itemToRemove.id);
+  if(frm) frm.submit();
+}
+/* Restaurar posição do scroll após redirect sem pular para o topo */
+function restoreScrollPosition(){
+  var y=sessionStorage.getItem('funil_scroll_y');
+  if(y!==null){
+    window.scrollTo({top:parseInt(y,10),behavior:'instant'});
+    sessionStorage.removeItem('funil_scroll_y');
+  }
+}
+restoreScrollPosition();
+window.addEventListener('DOMContentLoaded', function(){
+  restoreScrollPosition();
+  var frm = document.getElementById('form-add-edge');
+  if(frm){
+    frm.addEventListener('submit', function(){
+      var elos = document.querySelectorAll('#chain-builder .chain-elo');
+      var steps = [];
+      elos.forEach(function(elo){
+        var selects = elo.querySelectorAll('select');
+        var ids = [];
+        selects.forEach(function(s){
+          if(s.value && ids.indexOf(s.value) === -1) ids.push(s.value);
+        });
+        if(ids.length > 0) steps.push(ids);
+      });
+      var hidden = document.getElementById('chain_steps_json');
+      if(hidden) hidden.value = JSON.stringify(steps);
+    });
+  }
+});
+</script>
+</body>
+</html>`);
+});
+
+app.post("/admin/funis/add-node", async (req, res) => {
+  const { slug, tipo, rotulo, url } = req.body;
+  if (!slug || !tipo || !rotulo || !url) return res.redirect(`/admin/funis/${slug || ""}`);
+  if (!TIPOS_ORDEM.includes(tipo)) return res.redirect(`/admin/funis/${slug}`);
+  await query(`INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1,$2,$3,$4)`, [slug, tipo, rotulo, url]);
+  console.log(`[FUNIS] add-node slug=${slug} tipo=${tipo} rotulo=${rotulo}`);
+  res.redirect(`/admin/funis/${slug}?ok=node-add`);
+});
+
+app.post("/admin/funis/remover-node", async (req, res) => {
+  const { node_id, slug } = req.body;
+  if (!node_id) return res.redirect("/admin");
+  await query(`DELETE FROM funnel_nodes WHERE id=$1`, [node_id]);
+  console.log(`[FUNIS] remover-node node_id=${node_id}`);
+  res.redirect(`/admin/funis/${slug}?ok=node-rem`);
+});
+
+app.post("/admin/funis/add-edge", async (req, res) => {
+  const { slug, chain_steps_json } = req.body;
+  if (!slug) return res.redirect("/admin");
+
+  let steps = [];
+  try {
+    steps = JSON.parse(chain_steps_json || "[]");
+  } catch (e) {}
+
+  if (!steps.length && req.body.chain_ids) {
+    let chain = req.body.chain_ids;
+    if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+    steps = chain.map(id => [String(id)]).filter(arr => arr[0]);
+  }
+
+  if (steps.length < 2) return res.redirect(`/admin/funis/${slug}?erro=sem-etapas`);
+
+  for (let i = 0; i < steps.length - 1; i++) {
+    const fromNodes = steps[i];
+    const toNodes = steps[i + 1];
+    for (const from of fromNodes) {
+      for (const to of toNodes) {
+        if (from === to) continue;
+        const { rows: exist } = await query(
+          `SELECT id FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2 LIMIT 1`,
+          [from, to]
+        );
+        if (!exist.length) {
+          await query(`INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1,$2)`, [from, to]);
+          console.log(`[FUNIS] add-edge ${from} -> ${to}`);
+        }
+      }
+    }
+  }
+  res.redirect(`/admin/funis/${slug}?ok=edge-add`);
+});
+
+app.post("/admin/funis/remover-edge", async (req, res) => {
+  const { edge_id, slug } = req.body;
+  if (!edge_id) return res.redirect("/admin");
+  await query(`DELETE FROM funnel_edges WHERE id=$1`, [edge_id]);
+  console.log(`[FUNIS] remover-edge edge_id=${edge_id}`);
+  res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
+});
+
+app.post("/admin/funis/remover-caminho", async (req, res) => {
+  const { slug, funil_node_ids } = req.body;
+  let ids = [];
+  try {
+    ids = JSON.parse(funil_node_ids || "[]");
+  } catch (e) {}
+
+  if (!ids.length && req.body.chain_ids) {
+    let chain = req.body.chain_ids;
+    if (!Array.isArray(chain)) chain = chain ? [chain] : [];
+    ids = chain.map(String).filter(Boolean);
+  }
+
+  if (!slug || ids.length < 2) return res.redirect(`/admin/funis/${slug || ""}`);
+
+  for (const from of ids) {
+    for (const to of ids) {
+      if (from === to) continue;
+      await query(`DELETE FROM funnel_edges WHERE from_node_id=$1 AND to_node_id=$2`, [from, to]);
+    }
+  }
+  console.log(`[FUNIS] remover-caminho funil unificado:`, ids);
+  res.redirect(`/admin/funis/${slug}?ok=edge-rem`);
+});
+
+app.post("/api/funis/salvar-node", async (req, res) => {
+  const { slug, tipo, rotulo, url, checkout_url } = req.body;
+  if (!slug || !tipo || !rotulo || !url) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    // 1. Resolve ou cria o nó da Landing Page
+    let landingNodeId;
+    const { rows: existingLanding } = await query(
+      "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+      [slug, url]
+    );
+
+    if (existingLanding.length > 0) {
+      landingNodeId = existingLanding[0].id;
+      // Atualiza o tipo e rótulo caso tenham mudado
+      await query(
+        "UPDATE funnel_nodes SET tipo = $1, rotulo = $2 WHERE id = $3",
+        [tipo, rotulo, landingNodeId]
+      );
+    } else {
+      const { rows: newLanding } = await query(
+        "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, $2, $3, $4) RETURNING id",
+        [slug, tipo, rotulo, url]
+      );
+      landingNodeId = newLanding[0].id;
+    }
+
+    // 2. Se houver checkout preenchido, resolve o nó do checkout e conecta
+    if (checkout_url && checkout_url.trim()) {
+      let checkoutNodeId;
+      const cleanCheckout = checkout_url.trim();
+
+      const { rows: existingCheckout } = await query(
+        "SELECT id FROM funnel_nodes WHERE slug = $1 AND url = $2 LIMIT 1",
+        [slug, cleanCheckout]
+      );
+
+      if (existingCheckout.length > 0) {
+        checkoutNodeId = existingCheckout[0].id;
+      } else {
+        const { rows: newCheckout } = await query(
+          "INSERT INTO funnel_nodes (slug, tipo, rotulo, url) VALUES ($1, 'checkout', 'Checkout', $2) RETURNING id",
+          [slug, cleanCheckout]
+        );
+        checkoutNodeId = newCheckout[0].id;
+      }
+
+      // 3. Cria a conexão (edge) entre a Landing Page e o Checkout se não existir
+      const { rows: existingEdge } = await query(
+        "SELECT id FROM funnel_edges WHERE from_node_id = $1 AND to_node_id = $2 LIMIT 1",
+        [landingNodeId, checkoutNodeId]
+      );
+
+      if (existingEdge.length === 0) {
+        await query(
+          "INSERT INTO funnel_edges (from_node_id, to_node_id) VALUES ($1, $2)",
+          [landingNodeId, checkoutNodeId]
+        );
+        console.log(`[FUNIL] Conectou nó ${landingNodeId} ao checkout ${checkoutNodeId}`);
+      }
+    }
+
+    res.json({ success: true, landingNodeId });
+  } catch (err) {
+    console.error("[API] Error saving funnel node:", err.message);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Página de visão geral — mapa de funis de todos os players
+app.get("/funis", async (_req, res) => {
+  const { rows: pages } = await query(
+    "SELECT slug, nome, url, tipo FROM pages ORDER BY created_at DESC"
+  );
+
+  const { rows: allNodes } = await query(`SELECT id, slug, tipo, rotulo, url FROM funnel_nodes`);
+  const { rows: allEdges } = await query(`SELECT id, from_node_id, to_node_id FROM funnel_edges`);
+
+  const nodesBySlug = {};
+  allNodes.forEach(n => { (nodesBySlug[n.slug] ||= []).push(n); });
+
+  const nodeIdToSlug = {};
+  allNodes.forEach(n => { nodeIdToSlug[n.id] = n.slug; });
+  const edgesBySlug = {};
+  allEdges.forEach(e => {
+    const s = nodeIdToSlug[e.from_node_id];
+    if (s) (edgesBySlug[s] ||= []).push(e);
+  });
+
+  const comMapa = [];
+  const semMapa = [];
+  for (const p of pages) {
+    const nodes = nodesBySlug[p.slug] || [];
+    if (nodes.length === 0) { semMapa.push(p); continue; }
+    const edges = edgesBySlug[p.slug] || [];
+    const caminhos = computarCaminhos(nodes, edges);
+    comMapa.push({ ...p, caminhos });
+  }
+
+  const cardsHtml = comMapa.map(p => `
+    <div class="player-card">
+      <div class="player-hdr">
+        <span class="player-tipo-badge ${p.tipo === "dominio" ? "b-dom" : "b-pag"}">${p.tipo === "dominio" ? "🌐" : "📡"}</span>
+        <a href="${p.url}" target="_blank" rel="noopener" class="player-nome">${p.nome}</a>
+        <a href="/admin/funis/${p.slug}" class="player-edit-link">✏️ Editar</a>
+      </div>
+      <div class="player-caminhos">
+        ${p.caminhos.map((c, idx) => renderCaminho(c, idx, false)).join("")}
+      </div>
+    </div>`).join("");
+
+  const semMapaHtml = semMapa.length ? `
+    <div class="card" style="margin-top:8px">
+      <h2>💤 Sem funil mapeado ainda (${semMapa.length})</h2>
+      <div class="sem-mapa-list">
+        ${semMapa.map(p => `<a href="/admin/funis/${p.slug}" class="sem-mapa-item">${p.tipo === "dominio" ? "🌐" : "📡"} ${p.nome}</a>`).join("")}
+      </div>
+    </div>` : "";
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mapa de Funis — Nutra Monitor</title>
+<style>
+:root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;padding:24px;max-width:1100px;margin:0 auto}
+.hdr{display:flex;align-items:center;gap:14px;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.hdr h1{font-size:19px;font-weight:700}
+.hdr-sub{font-size:12px;color:var(--muted);margin-top:3px}
+.hdr-nav{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+.hdr-nav a{font-size:12px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:6px 14px;border-radius:8px;white-space:nowrap}
+.hdr-nav a:hover{background:var(--accent);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 22px;margin-bottom:18px}
+.card h2{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px}
+.player-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.player-hdr{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.player-tipo-badge{font-size:15px}
+.player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
+.player-nome:hover{color:var(--accent)}
+.player-edit-link{margin-left:auto;font-size:11px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:4px 10px;border-radius:6px;white-space:nowrap}
+.player-edit-link:hover{background:var(--accent);color:#fff}
+.player-caminhos{display:flex;flex-direction:column;gap:8px}
+.caminho-row{display:flex;align-items:center;flex-wrap:wrap;gap:2px;background:#0f0f1e;border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.flow-tree-node{display:inline-flex;align-items:center}
+.flow-linear-branch{display:inline-flex;align-items:center}
+.flow-tree-branches{display:flex;flex-direction:column;justify-content:center;gap:12px;position:relative;margin-left:8px;padding-left:18px}
+.flow-tree-branches::before{content:'';position:absolute;left:0;top:16px;bottom:16px;width:2px;background:rgba(167,139,250,0.45);border-radius:2px}
+.flow-tree-branch{display:inline-flex;align-items:center;position:relative}
+.flow-tree-branch::before{content:'';position:absolute;left:-18px;top:50%;width:12px;height:2px;background:rgba(167,139,250,0.45)}
+.flow-branch-content{display:inline-flex;align-items:center}
+.flow-row-container{min-height:54px}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
+.chip:hover{border-color:var(--accent)}
+.chip-icon{font-size:13px}
+.chip-arrow{color:var(--muted);font-size:15px;font-weight:700;margin:0 2px}
+.empty-state{color:var(--muted);font-size:13px;text-align:center;padding:32px;border:1px dashed var(--border);border-radius:12px}
+.sem-mapa-list{display:flex;flex-wrap:wrap;gap:8px}
+.sem-mapa-item{font-size:12px;color:var(--muted);text-decoration:none;background:#0f0f1e;border:1px solid var(--border);border-radius:7px;padding:6px 12px}
+.sem-mapa-item:hover{color:var(--accent);border-color:var(--accent)}
+@media(max-width:640px){.hdr-nav{width:100%}.hdr-nav a{flex:1;text-align:center}}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div>
+    <h1>🔀 Mapa de Funis</h1>
+    <div class="hdr-sub">Visão geral de todos os caminhos mapeados por biblioteca/domínio</div>
+  </div>
+  <div class="hdr-nav">
+    <a href="/admin">⚙️ Admin</a>
+    <a href="/dashboard">📊 Dashboard</a>
+  </div>
+</div>
+
+${comMapa.length === 0
+  ? '<div class="empty-state">Nenhum funil mapeado ainda. Vá em Admin → 🔀 Funis num player para começar.</div>'
+  : cardsHtml}
+
+${semMapaHtml}
+
+</body>
+</html>`);
+});
+
+// ─── Dashboard ───────────────────────────────────────────────────────────────
+
+// SVG da logo do Instagram (inline, sem dependência externa)
+const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="ig" x1="0" y1="24" x2="24" y2="0"><stop offset="0%" stop-color="#f09433"/><stop offset="25%" stop-color="#e6683c"/><stop offset="50%" stop-color="#dc2743"/><stop offset="75%" stop-color="#cc2366"/><stop offset="100%" stop-color="#bc1888"/></linearGradient></defs><rect width="24" height="24" rx="6" fill="url(#ig)"/><rect x="3" y="3" width="18" height="18" rx="5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="12" cy="12" r="4.5" stroke="white" stroke-width="1.8" fill="none"/><circle cx="17.5" cy="6.5" r="1.2" fill="white"/></svg>`;
+
 app.get("/dashboard", async (_req, res) => {
   try {
-    const { rows: allPages } = await query("SELECT slug, nome, url, tipo, created_at, inicial_count FROM pages");
+    const { rows: allPages } = await query(
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil FROM pages"
+    );
 
-    // ─── FIX #3: conversão de fuso duplicada ──────────────────────────────
-    // As colunas collected_at são TIMESTAMP (sem timezone) e o valor gravado
-    // por NOW() já está em UTC "puro" (sessão do Postgres/Neon roda em UTC).
-    // O código antigo fazia `collected_at AT TIME ZONE 'America/Sao_Paulo'`,
-    // o que em Postgres NÃO converte de UTC pra BRT — ao contrário, assume
-    // que o valor já está em America/Sao_Paulo e devolve o instante UTC
-    // correspondente, deslocando o horário +3h além da conta. Isso fazia o
-    // fallback de slot (usado quando slot é NULL) "chutar" o horário errado.
-    // Fix: não usar AT TIME ZONE nenhum aqui — pega o timestamp cru (UTC) e
-    // subtrai 3h em JS pra obter o horário de Brasília.
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
     function toBrDate(utcNaiveTimestamp) {
       return new Date(new Date(utcNaiveTimestamp).getTime() - BR_OFFSET_MS);
     }
 
-    // Função que processa um conjunto de páginas e devolve os 2 pacotes de dados
-    // (dados gerais + dados da tabela histórica) para aquele grupo.
     async function processarGrupo(pagesDoGrupo) {
       const ultimaLeitura = {};
       const primeiraData = {};
       const paginas = {};
       const mon = {};
+      const meta = {}; // instagram_url, geo, nicho, funil por nome
 
       for (const p of pagesDoGrupo) {
         const { rows: hist } = await query(
@@ -862,20 +1936,12 @@ app.get("/dashboard", async (_req, res) => {
           [p.slug]
         );
 
-        // Lê o valor atual e a data da última checagem da scrape_latest
         const { rows: latest } = await query(
-          `SELECT ads_count, collected_at
-           FROM scrape_latest WHERE slug = $1 LIMIT 1`,
+          `SELECT ads_count, collected_at FROM scrape_latest WHERE slug = $1 LIMIT 1`,
           [p.slug]
         );
 
         const latestRow = latest[0];
-
-        // FIX #4: antes, um item sem nenhuma linha em scrape_history ainda
-        // (ex: acabou de ser cadastrado, cron não rodou) era simplesmente
-        // ignorado e não aparecia na dashboard. Agora, com captureInicial()
-        // gravando em scrape_latest no momento do cadastro, o item já tem
-        // dado suficiente pra aparecer imediatamente.
         const temDado = hist.length > 0 || !!latestRow;
         if (!temDado) continue;
 
@@ -887,25 +1953,24 @@ app.get("/dashboard", async (_req, res) => {
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
         };
 
-        // FIX #4: Descoberta agora vem DIRETO de pages.created_at — a data
-        // real do cadastro no /admin — em vez de ser inferida da primeira
-        // linha de scrape_history (frágil: dependia do cron já ter rodado
-        // e podia se confundir com dados antigos de slugs reciclados).
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
 
-        // FIX #4: Inicial vem do snapshot capturado no cadastro
-        // (pages.inicial_count). Fallback em cascata pra itens cadastrados
-        // ANTES dessa migração (inicial_count NULL): usa a 1ª linha do
-        // histórico do cron e, na ausência dela, o valor atual.
         mon[p.nome] = {
           ini: p.inicial_count ?? (hist.length ? hist[0].ads_count : (latestRow ? latestRow.ads_count : 0))
+        };
+
+        // Metadados para a dashboard
+        meta[p.nome] = {
+          instagram_url: p.instagram_url || null,
+          geo:           p.geo || null,
+          nicho:         p.nicho || null,
+          funil:         p.funil || null,
         };
 
         paginas[p.nome] = {};
         for (const h of hist) {
           const brDt = toBrDate(h.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
-          // Novo sistema: usa h.slot direto. Fallback por hora para registros antigos (slot null)
           const slot = (h.slot !== null && h.slot !== undefined)
             ? Number(h.slot)
             : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
@@ -914,7 +1979,6 @@ app.get("/dashboard", async (_req, res) => {
         }
       }
 
-      // Tabela histórica do grupo
       const slugs = pagesDoGrupo.map(p => p.slug);
       let histMap = {}, histDates = [];
       if (slugs.length) {
@@ -929,7 +1993,6 @@ app.get("/dashboard", async (_req, res) => {
           const nome = r.nome;
           const brDt = toBrDate(r.collected_at);
           const dk = brDt.toISOString().slice(0, 10);
-          // Novo sistema: usa r.slot direto. Fallback por hora para registros antigos (slot null)
           const slot = (r.slot !== null && r.slot !== undefined)
             ? Number(r.slot)
             : [3, 12, 22].reduce((b, s) => Math.abs(brDt.getUTCHours() - s) < Math.abs(brDt.getUTCHours() - b) ? s : b, 3);
@@ -943,26 +2006,29 @@ app.get("/dashboard", async (_req, res) => {
       const histLibs = Object.keys(paginas).sort((a, b) => (ultimaLeitura[b]?.ads || 0) - (ultimaLeitura[a]?.ads || 0));
 
       return {
-        geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon },
-        hist: { map: histMap, dates: histDates, libs: histLibs },
+        geral: { pags: paginas, ultima: ultimaLeitura, primeira: primeiraData, mon, meta },
+        hist:  { map: histMap, dates: histDates, libs: histLibs },
         count: Object.keys(paginas).length,
       };
     }
 
-    const grupoPaginas = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
+    const grupoPaginas  = await processarGrupo(allPages.filter(p => p.tipo !== "dominio"));
     const grupoDominios = await processarGrupo(allPages.filter(p => p.tipo === "dominio"));
 
-    const dados = JSON.stringify(grupoPaginas.geral);
-    const histDados = JSON.stringify(grupoPaginas.hist);
-    const dadosDom = JSON.stringify(grupoDominios.geral);
+    const dados       = JSON.stringify(grupoPaginas.geral);
+    const histDados   = JSON.stringify(grupoPaginas.hist);
+    const dadosDom    = JSON.stringify(grupoDominios.geral);
     const histDadosDom = JSON.stringify(grupoDominios.hist);
+
+    // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
+    const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
 
     res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VIVA Labs — Monitor</title>
+<title>Nutra Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -977,10 +2043,15 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 8px var(--up)}
 .section-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin:0 0 12px 2px;display:flex;align-items:center;gap:8px}
 .scaling-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin-bottom:26px}
-.scale-card{background:linear-gradient(135deg,#1a1530,#14122a);border:1px solid #2e2658;border-radius:14px;padding:16px 18px;position:relative;overflow:hidden}
-.scale-card.is-cut{background:linear-gradient(135deg,#2a1520,#231220);border-color:#4a2435}
-.scale-card-rank{position:absolute;top:12px;right:14px;font-size:11px;color:var(--muted);font-family:'Space Mono',monospace}
-.scale-card-name{font-size:13px;font-weight:600;color:#fff;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:24px}
+.scale-card{background:linear-gradient(135deg,#1a1530,#14122a);border:1px solid #2e2658;border-radius:14px;padding:16px 18px;position:relative;overflow:hidden;cursor:pointer;transition:all 0.25s cubic-bezier(0.16,1,0.3,1)}
+.scale-card:hover{border-color:var(--accent);box-shadow:0 8px 24px -6px rgba(124,111,255,0.35);transform:translateY(-2px)}
+.scale-card:active{transform:scale(0.982)}
+.scale-arrow{display:inline-block;transition:transform 0.25s ease, color 0.25s ease;font-weight:700;margin-left:4px}
+.scale-card:hover .scale-arrow{transform:translate(2px,-2px);color:var(--accent)}
+.scale-card-toast{position:absolute;inset:0;background:rgba(18,18,31,0.92);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;gap:8px;color:#34d399;font-weight:700;font-size:14px;border-radius:14px;opacity:0;transform:scale(0.92);pointer-events:none;transition:all 0.25s cubic-bezier(0.16,1,0.3,1);z-index:10}
+.scale-card-toast.show{opacity:1;transform:scale(1)}
+.scale-card-rank{position:absolute;top:12px;right:14px;font-size:11px;color:var(--muted);font-family:'Space Mono',monospace;display:flex;align-items:center}
+.scale-card-name{font-size:13px;font-weight:600;color:#fff;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:34px}
 .scale-card-val{font-size:30px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;line-height:1}
 .scale-card-meta{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:12px}
 .scale-pct{font-weight:600;font-family:'Space Mono',monospace}
@@ -988,7 +2059,6 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .empty-hint{background:var(--surface);border:1px dashed var(--border);border-radius:12px;padding:22px;text-align:center;color:var(--muted);font-size:13px;margin-bottom:26px}
 .lib-link{color:var(--text);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:1px;transition:color .15s,border-color .15s}
 .lib-link:hover{color:var(--accent);border-color:var(--accent)}
-
 .accordion-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .accordion-btn{width:100%;display:flex;align-items:center;gap:10px;padding:14px 18px;background:transparent;border:none;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:13px;font-weight:600;cursor:pointer;text-align:left;transition:background .15s}
 .accordion-btn:hover{background:var(--surface2)}
@@ -1015,7 +2085,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 thead th{background:var(--surface2);color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.6px;padding:11px 16px;text-align:left;font-weight:600}
 td{padding:11px 16px;border-top:1px solid var(--border);color:var(--text2);white-space:nowrap}
 tbody tr:hover td{background:var(--surface2)}
-.t-name{font-weight:600;color:#fff}
+.t-name{font-weight:600;color:#fff;white-space:normal}
+.t-name-main{display:block;font-weight:600;color:#fff;margin-bottom:4px}
+.t-meta-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+.t-geo-badge{font-size:10px;background:rgba(34,211,238,.1);color:#22d3ee;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
+.t-nicho-badge{font-size:10px;background:rgba(167,139,250,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
+.t-funil-badge{font-size:10px;background:rgba(251,191,36,.12);color:#fbbf24;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
 .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:7px;font-size:11px;font-weight:600;font-family:'Space Grotesk'}
 .b-up{background:rgba(52,211,153,.13);color:#34d399}
 .b-hot{background:rgba(167,139,250,.15);color:#a78bfa}
@@ -1025,8 +2100,11 @@ tbody tr:hover td{background:var(--surface2)}
 .scalebar-bg{width:80px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-right:8px}
 .scalebar{height:5px;border-radius:3px;display:block}
 .spark3{font-family:'Space Mono',monospace;font-size:13px}
-@media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
-
+.ig-cell{text-align:center}
+.ig-link{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;transition:background .15s}
+.ig-link:hover{background:rgba(220,39,67,.15)}
+.ig-none{color:var(--muted);font-size:13px}
+.mono{font-family:'Space Mono',monospace}
 .hist-tbl thead th{white-space:nowrap}
 .hist-tbl td{font-family:'Space Mono',monospace;font-size:12px;text-align:center}
 .hist-tbl td.lib-name{text-align:left;font-family:'Space Grotesk',sans-serif;font-weight:600;color:#fff;white-space:nowrap}
@@ -1034,7 +2112,8 @@ tbody tr:hover td{background:var(--surface2)}
 .hist-slot{display:inline-block;min-width:42px;text-align:right}
 .hist-slot.empty{color:var(--border)}
 .tbl-scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch}
-
+.group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+@media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
 @media(max-width:768px){
   body{padding:12px}
   .hdr{flex-wrap:wrap;gap:8px}
@@ -1048,91 +2127,32 @@ tbody tr:hover td{background:var(--surface2)}
   .rosca-wrap{flex-direction:column;align-items:flex-start}
   .rosca-canvas{width:120px;height:120px}
   .hist-box{height:220px}
-
   .tbl-panel table thead{display:none}
-  .tbl-panel table tbody tr{
-    display:block;
-    background:var(--surface2);
-    border:1px solid var(--border);
-    border-radius:10px;
-    margin-bottom:10px;
-    padding:12px 14px;
-  }
-  .tbl-panel table tbody td{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    padding:5px 0;
-    border-top:none;
-    white-space:normal;
-    font-size:12px;
-  }
-  .tbl-panel table tbody td::before{
-    content:attr(data-label);
-    font-size:10px;
-    font-weight:600;
-    color:var(--muted);
-    text-transform:uppercase;
-    letter-spacing:.5px;
-    margin-right:10px;
-    flex-shrink:0;
-  }
+  .tbl-panel table tbody tr{display:block;background:var(--surface2);border:1px solid var(--border);border-radius:10px;margin-bottom:10px;padding:12px 14px}
+  .tbl-panel table tbody td{display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-top:none;white-space:normal;font-size:12px}
+  .tbl-panel table tbody td::before{content:attr(data-label);font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:10px;flex-shrink:0}
   .tbl-panel table tbody td.t-name{font-size:14px;font-weight:700;color:#fff;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:4px}
   .tbl-panel table tbody td.t-name::before{display:none}
   .scalebar-bg{width:50px}
 }
-
-@media(max-width:480px){
-  .scaling-strip{grid-template-columns:1fr}
-}
-.group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+@media(max-width:480px){.scaling-strip{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 
 <div class="hdr">
   <div>
-    <h1>Monitor de Bibliotecas</h1>
+    <h1>📊 Nutra Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
     <div class="hdr-live" style="margin-left:0"><span class="dot"></span><span id="livecount"></span></div>
-    <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
-  </div>
-</div>
-
-<div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
-
-<div class="section-label">🚀 Escalando agora — domínios em ascensão</div>
-<div class="scaling-strip" id="dom_scaling"></div>
-<div class="empty-hint" id="dom_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
-
-<div class="grid-charts">
-  <div class="panel">
-    <div class="panel-title">🍩 Distribuição atual</div>
-    <div class="rosca-wrap">
-      <div class="rosca-canvas"><canvas id="dom_cRosca"></canvas></div>
-      <div class="legend" id="dom_legend"></div>
+    <div style="display:flex;gap:8px">
+      <a href="/admin" class="hdr-admin-btn">⚙️ Ir para Admin</a>
+      <a href="/funis" class="hdr-admin-btn">🔀 Ver Mapa de Funis</a>
     </div>
   </div>
-  <div class="panel">
-    <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
-    <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
-  </div>
 </div>
-
-<div class="section-label">📋 Resumo completo</div>
-<div class="tbl-panel">
-  <table>
-    <thead><tr>
-      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
-    </tr></thead>
-    <tbody id="dom_tbody"></tbody>
-  </table>
-</div>
-
-<div style="height:36px"></div>
 
 <div class="group-title">📡 BIBLIOTECAS — rastreio por página</div>
 
@@ -1159,7 +2179,7 @@ tbody tr:hover td{background:var(--surface2)}
   <table>
     <thead><tr>
       <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
-      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
   </table>
@@ -1167,34 +2187,73 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div style="height:36px"></div>
 
-<div class="group-title">📅 Histórico de Coletas</div>
+<div class="group-title">🌐 DOMÍNIOS — rastreio por URL</div>
 
-<div class="accordion-wrap">
-  <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
-    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
-    <span class="acc-meta" id="dom_acc-meta"></span>
-    <span class="acc-icon" id="dom_acc-icon">▼</span>
-  </button>
-  <div class="accordion-body" id="dom_hist-section">
-    Carregando histórico...
+<div class="section-label">🚀 Escalando agora — domínios em ascensão</div>
+<div class="scaling-strip" id="dom_scaling"></div>
+<div class="empty-hint" id="dom_scaling-empty" style="display:none">Nenhum item em ascensão no período. Conforme as coletas acumulam, o que cresce aparece aqui.</div>
+
+<div class="grid-charts">
+  <div class="panel">
+    <div class="panel-title">🍩 Distribuição atual</div>
+    <div class="rosca-wrap">
+      <div class="rosca-canvas"><canvas id="dom_cRosca"></canvas></div>
+      <div class="legend" id="dom_legend"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">📈 Evolução histórica — média diária <span style="color:var(--down);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">● dia de descoberta</span></div>
+    <div class="hist-box"><canvas id="dom_cHist"></canvas></div>
   </div>
 </div>
 
-<div class="accordion-wrap" style="margin-top:12px">
+<div class="section-label">📋 Resumo completo</div>
+<div class="tbl-panel">
+  <table>
+    <thead><tr>
+      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
+    </tr></thead>
+    <tbody id="dom_tbody"></tbody>
+  </table>
+</div>
+
+<div style="height:36px"></div>
+
+<div class="group-title">🔀 Mapeamento de Funis</div>
+<div class="empty-hint" style="display:flex;align-items:center;justify-content:center;gap:14px">
+  <span>O mapeamento completo de funis agora tem uma página dedicada.</span>
+  <a href="/funis" style="font-size:13px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:8px 18px;border-radius:8px;white-space:nowrap">🔀 Abrir Mapa de Funis</a>
+</div>
+
+<div style="height:36px"></div>
+
+<div class="group-title">📅 Histórico de Coletas</div>
+
+<div class="accordion-wrap">
   <button class="accordion-btn" onclick="toggleAccordion('pag_hist-section','pag_acc-icon')">
     <span>📡 Histórico de Coletas — Bibliotecas · 03h · 12h · 22h</span>
     <span class="acc-meta" id="pag_acc-meta"></span>
     <span class="acc-icon" id="pag_acc-icon">▼</span>
   </button>
-  <div class="accordion-body" id="pag_hist-section">
-    Carregando histórico...
-  </div>
+  <div class="accordion-body" id="pag_hist-section">Carregando histórico...</div>
+</div>
+
+<div class="accordion-wrap" style="margin-top:12px">
+  <button class="accordion-btn" onclick="toggleAccordion('dom_hist-section','dom_acc-icon')">
+    <span>🌐 Histórico de Coletas — Domínios · 03h · 12h · 22h</span>
+    <span class="acc-meta" id="dom_acc-meta"></span>
+    <span class="acc-icon" id="dom_acc-icon">▼</span>
+  </button>
+  <div class="accordion-body" id="dom_hist-section">Carregando histórico...</div>
 </div>
 
 <script>
+const IG_SVG=\`${IG_SVG_ESC}\`;
+
 document.getElementById("upd").textContent="Atualizado "+new Date().toLocaleString("pt-BR")+"  ·  coletas 03h · 12h · 22h";
 
-function toggleAccordion(bodyId, iconId){
+function toggleAccordion(bodyId,iconId){
   const body=document.getElementById(bodyId);
   const icon=document.getElementById(iconId);
   body.classList.toggle('open');
@@ -1206,12 +2265,10 @@ const COR=["#7c6fff","#34d399","#fb7185","#fbbf24","#22d3ee","#a78bfa","#f97316"
 function med(s){const v=Object.values(s).filter(x=>!isNaN(x));return v.length?Math.round(v.reduce((a,b)=>a+b,0)/v.length):null}
 function fd(dk){const[y,m,d]=dk.split("-");return d+"/"+m}
 function fdFull(dk){const[y,m,d]=dk.split("-");return d+"/"+m+"/"+y}
-const{pags,ultima,primeira,mon}=D;
+const{pags,ultima,primeira,mon,meta}=D;
 const LP=Object.keys(pags).sort();
 const dSet=new Set();LP.forEach(p=>Object.keys(pags[p]).forEach(d=>dSet.add(d)));
 const datas=Array.from(dSet).sort();
-const ult=datas[datas.length-1];
-
 
 function serie(pag){return datas.map(dk=>pags[pag]?.[dk]?med(pags[pag][dk]):null)}
 function slope(pag){
@@ -1251,7 +2308,36 @@ if(escalando.length===0){
   escalando.forEach((x,i)=>{
     const card=document.createElement("div");
     card.className="scale-card";
-    card.innerHTML='<div class="scale-card-rank">#'+(i+1)+'</div>'
+    const urlBib = ultima[x.p]?.url || "";
+    card.title = "Clique para copiar o link e abrir a biblioteca de " + x.p;
+    card.onclick = function() {
+      if (urlBib) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(urlBib).catch(()=>{});
+        } else {
+          const ta = document.createElement("textarea");
+          ta.value = urlBib;
+          document.body.appendChild(ta);
+          ta.select();
+          try { document.execCommand("copy"); } catch(e){}
+          document.body.removeChild(ta);
+        }
+        window.open(urlBib, "_blank", "noopener");
+      }
+      let oldToast = card.querySelector(".scale-card-toast");
+      if (oldToast) oldToast.remove();
+      const toast = document.createElement("div");
+      toast.className = "scale-card-toast";
+      toast.innerHTML = '<span style="font-size:16px">✓</span> Link copiado!';
+      card.appendChild(toast);
+      void toast.offsetWidth;
+      toast.classList.add("show");
+      setTimeout(()=>{
+        toast.classList.remove("show");
+        setTimeout(()=>{ toast.remove(); }, 300);
+      }, 2000);
+    };
+    card.innerHTML='<div class="scale-card-rank">#'+(i+1)+' <span class="scale-arrow">↗</span></div>'
       +'<div class="scale-card-name">'+x.p+'</div>'
       +'<div class="scale-card-val">'+x.at.toLocaleString("pt-BR")+'</div>'
       +'<div class="scale-card-meta"><span class="scale-pct" style="color:'+x.color+'">'+(x.pct>=0?"+":"")+x.pct+'%</span>'
@@ -1270,19 +2356,35 @@ porAds.forEach((pag,idx)=>{
   const spark3=last3.length>=2?(last3[last3.length-1]>last3[0]?'<span style="color:#34d399">▲ sub</span>':last3[last3.length-1]<last3[0]?'<span style="color:#fb7185">▼ cai</span>':'<span style="color:#888">= est</span>'):"—";
   const partPct=Math.round((x.at/maxAds)*100);
   const corLib=COR[idx%COR.length];
+
+  // Monta célula do nome com badges de geo e nicho
+  const m=meta?.[pag]||{};
+  const geoBadge=m.geo?'<span class="t-geo-badge">🌍 '+m.geo+'</span>':'';
+  const nichoBadge=m.nicho?'<span class="t-nicho-badge">🏷️ '+m.nicho+'</span>':'';
+  const funilBadge=m.funil?'<span class="t-funil-badge">🎯 '+m.funil+'</span>':'';
+  const metaBadgesHtml=(geoBadge||nichoBadge||funilBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+funilBadge+'</div>':'';
+  const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
+
+  // Célula do Instagram
+  const igCell=m.instagram_url
+    ?'<a href="'+m.instagram_url+'" target="_blank" rel="noopener" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
+    :'<span class="ig-none">—</span>';
+
   const tr=document.createElement("tr");
-  tr.innerHTML='<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
-  +'<td class="t-name"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></td>'
-  +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
-  +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
-  +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
-  +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
-  +(ultima[pag]?.ultimaColeta ? new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—')
-  +'</td>'
-  +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
-  +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
-  +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
-  +'<td class="spark3" data-label="3 dias">'+spark3+'</td>';
+  tr.innerHTML=
+    '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
+    +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
+    +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
+    +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
+    +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
+    +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
+    +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +'</td>'
+    +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
+    +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
+    +'<td data-label="Participação"><span class="scalebar-bg"><span class="scalebar" style="width:'+partPct+'%;background:'+corLib+'"></span></span><span class="mono" style="font-size:11px;color:var(--muted)">'+partPct+'%</span></td>'
+    +'<td class="spark3" data-label="3 dias">'+spark3+'</td>'
+    +'<td class="ig-cell" data-label="Instagram">'+igCell+'</td>';
   tbody.appendChild(tr);
 });
 
@@ -1363,7 +2465,7 @@ if(!HD.dates.length||!HD.libs.length){
   tbody2+='</tbody>';
   histSection.innerHTML='<div class="tbl-scroll-x"><table class="hist-tbl">'+thead+tbody2+'</table></div>';
   const metaEl=document.getElementById(P+"acc-meta");
-  if(metaEl) metaEl.textContent='('+rowCount+' registros)';
+  if(metaEl)metaEl.textContent='('+rowCount+' registros)';
 }
 }
 
@@ -1375,8 +2477,8 @@ const HD_PAG=__HIST_PLACEHOLDER__;
 const totalLibs=Object.keys(D_DOM.pags).length+Object.keys(D_PAG.pags).length;
 document.getElementById("livecount").textContent=Object.keys(D_DOM.pags).length+" domínios · "+Object.keys(D_PAG.pags).length+" Páginas/FanPage";
 
-render(D_DOM,HD_DOM,"dom_");
 render(D_PAG,HD_PAG,"pag_");
+render(D_DOM,HD_DOM,"dom_");
 
 <\/script>
 </body>
@@ -1390,9 +2492,9 @@ render(D_PAG,HD_PAG,"pag_");
   }
 });
 
-// ─── Scheduler (internal cron — replaces Make.com) ──────────────────────────────
+// ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// Cron em UTC explicito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
+// Cron em UTC explícito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
 cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
 cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
 cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
